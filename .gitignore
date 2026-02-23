@@ -1,2 +1,5 @@
 __pycache__/**
 __pycache__/vote_bot_oauth.cpython-313.pyc
+token.json
+oauth_client.json
+__pycache__/vote_bot_oauth.cpython-313.pyc

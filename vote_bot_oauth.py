@@ -19,6 +19,7 @@ from telegram.ext import (
 from telegram.ext import InlineQueryHandler, ChosenInlineResultHandler, PollAnswerHandler
 import uuid
 
+from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
@@ -29,8 +30,8 @@ from googleapiclient.discovery import build
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ["BOT_TOKEN"]
 TELEGRAM_WEBHOOK_URL = os.environ["TELEGRAM_WEBHOOK_URL"]  # e.g. https://your-render-service.onrender.com/webhook
 PORT = int(os.environ.get("PORT", "10000"))
-CLIENT_JSON = os.environ["OAUTH_CLIENT_JSON"]
-TOKEN_JSON = os.environ["OAUTH_TOKEN_JSON"]
+CLIENT_JSON = os.environ["OAUTH_CLIENT_JSON"].strip()  # file path or raw OAuth client JSON
+TOKEN_JSON = os.environ["OAUTH_TOKEN_JSON"].strip()  # file path or raw authorized-user token JSON
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
 SHEET_LINK_SHARE_ROLE = os.environ.get("SHEET_LINK_SHARE_ROLE", "").strip().lower()  # "", reader, writer, commenter
 SHEET_LINK_ALLOW_DISCOVERY = os.environ.get("SHEET_LINK_ALLOW_DISCOVERY", "false").strip().lower() in {"1", "true", "yes"}
@@ -75,17 +76,59 @@ VOTES_HEADERS = [
 # --------------------
 # Google OAuth helpers
 # --------------------
+def _env_json_or_path(value: str, env_name: str) -> tuple[Optional[dict], Optional[str]]:
+    raw = (value or "").strip()
+    if not raw:
+        raise ValueError(f"{env_name} is empty")
+
+    if raw.startswith("{"):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"{env_name} looks like JSON but could not be parsed: {e}") from e
+        if not isinstance(parsed, dict):
+            raise ValueError(f"{env_name} must be a JSON object")
+        return parsed, None
+
+    return None, raw
+
+
+def _write_token_file(token_path: str, creds: Credentials) -> None:
+    token_dir = os.path.dirname(token_path)
+    if token_dir:
+        os.makedirs(token_dir, exist_ok=True)
+    with open(token_path, "w", encoding="utf-8") as f:
+        f.write(creds.to_json())
+
+
 def load_or_login_creds() -> Credentials:
+    client_info, client_path = _env_json_or_path(CLIENT_JSON, "OAUTH_CLIENT_JSON")
+    token_info, token_path = _env_json_or_path(TOKEN_JSON, "OAUTH_TOKEN_JSON")
+
     creds: Optional[Credentials] = None
-    if os.path.exists(TOKEN_JSON):
-        creds = Credentials.from_authorized_user_file(TOKEN_JSON, SCOPES)
+    if token_info is not None:
+        creds = Credentials.from_authorized_user_info(token_info, SCOPES)
+    elif token_path and os.path.exists(token_path):
+        creds = Credentials.from_authorized_user_file(token_path, SCOPES)
+
+    if creds and not creds.valid and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(Request())
+            if token_path:
+                _write_token_file(token_path, creds)
+        except Exception as e:
+            print("OAuth token refresh failed; falling back to interactive login:", e)
 
     if not creds or not creds.valid:
-        flow = InstalledAppFlow.from_client_secrets_file(CLIENT_JSON, SCOPES)
+        if client_info is not None:
+            flow = InstalledAppFlow.from_client_config(client_info, SCOPES)
+        else:
+            flow = InstalledAppFlow.from_client_secrets_file(client_path, SCOPES)
         creds = flow.run_local_server(port=0)
-        os.makedirs(os.path.dirname(TOKEN_JSON), exist_ok=True)
-        with open(TOKEN_JSON, "w", encoding="utf-8") as f:
-            f.write(creds.to_json())
+        if token_path:
+            _write_token_file(token_path, creds)
+        else:
+            print("OAUTH_TOKEN_JSON is raw JSON; new token cannot be persisted automatically.")
     return creds
 
 
