@@ -72,6 +72,17 @@ VOTES_HEADERS = [
     "ts_utc", "chat_id", "message_id", "user_id", "username", "full_name", "choice", "lunch", "action"
 ]
 
+PUBLISHPOLL_SAMPLE_TEMPLATE = (
+    "title=DAYWA Discussions\n"
+    "desc=Join us for an afternoon...\n"
+    "date=23 Feb 2026\n"
+    "venue=Balestier Road\n"
+    "lunch=12:30-2pm\n"
+    "session=2-4pm\n"
+    "option1=discussion session only (default value)\n"
+    "option2=discussion session + lunch (default value)\n"
+)
+
 
 # --------------------
 # Google OAuth helpers
@@ -980,17 +991,20 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ready.\n"
         "Use /vote to post the 2-option vote.\n"
         "Use /publishpoll to send a forwardable native Telegram poll (supports cap=).\n"
-        "Sample: /publishpoll \n"
-        "title=DAYWA Discussions\n"
-        "desc=Join us for an afternoon...\n"
-        "date=23 Feb 2026\n"
-        "venue=Balestier Road\n"
-        "lunch=12:30-2pm\n"
-        "session=2-4pm\n"
-        "option1=discussion session only (default value)\n"
-        "option2=discussion session + lunch (default value)\n"
+        "Use /sample to get a copy-paste template for /publishpoll.\n"
         "A new spreadsheet is created per poll message (inline: on send, /vote: on first vote)."
     )
+
+
+async def sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+    await msg.reply_text(
+        "Copy-paste this after /publishpoll:\n"
+        f"{PUBLISHPOLL_SAMPLE_TEMPLATE}"
+    )
+
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query_text = update.inline_query.query or ""
@@ -1049,15 +1063,8 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Usage: /publishpoll + key=value lines.\n"
             "Supports title/desc/date/venue/lunch/session/cap and option1/option2.\n\n"
             "Example:\n"
-            "title=DAYWA Discussions\n"
-            "desc=Join us for an afternoon...\n"
-            "date=23 Feb 2026\n"
-            "venue=Balestier Road\n"
-            "lunch=12:30-2pm\n"
-            "session=2-4pm\n"
+            f"{PUBLISHPOLL_SAMPLE_TEMPLATE}"
             "cap=40\n"
-            "option1=discussion session only\n"
-            "option2=discussion session + lunch"
         )
         return
 
@@ -1475,6 +1482,7 @@ def initialize_runtime_services():
 def build_telegram_application() -> Application:
     telegram_app = Application.builder().token(BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("sample", sample))
     telegram_app.add_handler(CommandHandler("vote", vote))
     telegram_app.add_handler(CommandHandler("publishpoll", publishpoll))
     telegram_app.add_handler(PollAnswerHandler(on_native_poll_answer))
