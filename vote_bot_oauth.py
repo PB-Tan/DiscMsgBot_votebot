@@ -10,9 +10,7 @@ import json
 from itertools import zip_longest
 from datetime import datetime, timezone
 from typing import Optional
-
-import uvicorn
-from fastapi import FastAPI, Request, Response
+from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
@@ -560,8 +558,6 @@ MEMBER_INDEX = {"enabled": False, "source": "", "handles": set(), "names": {}}
 MEMBER_INDEX_LAST_REFRESH_TS = 0.0
 SHEETS = None
 DRIVE = None
-TELEGRAM_APP: Optional[Application] = None
-WEB_APP = FastAPI(title="VoteBot Webhook")
 
 
 def _serialize_poll_state(state: dict) -> dict:
@@ -1445,53 +1441,25 @@ def build_telegram_application() -> Application:
     return telegram_app
 
 
-@WEB_APP.on_event("startup")
-async def _startup_webhook():
-    # Initialize/start the PTB Application once, then register Telegram webhook.
-    if TELEGRAM_APP is None:
-        raise RuntimeError("TELEGRAM_APP is not initialized")
-    await TELEGRAM_APP.initialize()
-    await TELEGRAM_APP.start()
-    await TELEGRAM_APP.bot.set_webhook(url=TELEGRAM_WEBHOOK_URL)
-    print("Webhook set:", TELEGRAM_WEBHOOK_URL)
-
-
-@WEB_APP.on_event("shutdown")
-async def _shutdown_webhook():
-    # Clean shutdown for PTB async resources on Render stop/redeploy.
-    if TELEGRAM_APP is None:
-        return
-    try:
-        await TELEGRAM_APP.bot.delete_webhook(drop_pending_updates=False)
-    except Exception as e:
-        print("Webhook delete failed:", e)
-    await TELEGRAM_APP.stop()
-    await TELEGRAM_APP.shutdown()
-
-
-@WEB_APP.get("/")
-async def healthcheck():
-    return {"ok": True}
-
-
-@WEB_APP.post("/webhook")
-async def telegram_webhook(request: Request):
-    # Telegram sends JSON updates here. We convert and dispatch to PTB.
-    if TELEGRAM_APP is None:
-        return Response("Telegram app not initialized", status_code=500)
-
-    data = await request.json()
-    update = Update.de_json(data, TELEGRAM_APP.bot)
-    await TELEGRAM_APP.process_update(update)
-    return Response("OK", status_code=200)
+def webhook_url_path(url: str) -> str:
+    # PTB run_webhook needs the URL path separately from the public webhook URL.
+    path = (urlparse(url).path or "/webhook").lstrip("/")
+    return path or "webhook"
 
 
 def main():
-    global TELEGRAM_APP
     initialize_runtime_services()
-    TELEGRAM_APP = build_telegram_application()
-    # Render requires binding to 0.0.0.0 and using the assigned PORT env var.
-    uvicorn.run(WEB_APP, host="0.0.0.0", port=PORT)
+    telegram_app = build_telegram_application()
+
+    # PTB's built-in webhook server is enough for Render (no Flask/FastAPI needed).
+    # Render assigns PORT and expects the service to bind to 0.0.0.0.
+    telegram_app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=webhook_url_path(TELEGRAM_WEBHOOK_URL),
+        webhook_url=TELEGRAM_WEBHOOK_URL,
+        drop_pending_updates=False,
+    )
 
 
 if __name__ == "__main__":
