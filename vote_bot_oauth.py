@@ -1509,6 +1509,7 @@ def main():
         port=PORT,
         url_path=webhook_url_path(TELEGRAM_WEBHOOK_URL),
         webhook_url=TELEGRAM_WEBHOOK_URL,
+        allowed_updates=Update.ALL_TYPES,
         drop_pending_updates=False,
     )
 
