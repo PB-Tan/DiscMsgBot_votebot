@@ -5,3 +5,6 @@ oauth_client.json
 __pycache__/vote_bot_oauth.cpython-313.pyc
 oauth_client.json
 token.json
+test-discmsgbot-7742f7d11711.json
+test_gsheet.py
+test_oauth_create_sheet.py
