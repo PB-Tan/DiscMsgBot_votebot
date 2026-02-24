@@ -57,11 +57,11 @@ CHOICES = [
 ]
 
 NAMES_HEADERS = [
-    'Paste "Username (TG link)" below ',
+    'TG Link',
     "Name (auto)",
     "TG Handle (auto)",
     "Sign up status \n[Signed up, Invite sent, Confirmed, Pulled out, Waitlisted]",
-    "Lunch",
+    "Lunch\n[Yes, No]",
     "Profile ",
     "Gender",
     "New? (auto)",
