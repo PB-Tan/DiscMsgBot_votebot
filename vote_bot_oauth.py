@@ -288,7 +288,7 @@ def create_new_spreadsheet(
     poll_metadata: Optional[dict[str, str]] = None,
     creator_handle: Optional[str] = None,
     creator_user_id: Optional[str] = None,
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     choices = choices or CHOICES
     sgt = timezone(timedelta(hours=8))
     ts = datetime.now(sgt).strftime("%Y-%m-%d_%H%M%S%z")
@@ -360,7 +360,7 @@ def create_new_spreadsheet(
         },
     ).execute()
 
-    return spreadsheet_id, url
+    return spreadsheet_id, url, title
 
 
 def append_row(sheets, spreadsheet_id: str, range_a1: str, row: list):
@@ -667,6 +667,7 @@ def _serialize_poll_state(state: dict) -> dict:
     return {
         "spreadsheet_id": str(state.get("spreadsheet_id", "")),
         "spreadsheet_url": str(state.get("spreadsheet_url", "")),
+        "spreadsheet_title": str(state.get("spreadsheet_title", "")),
         "choices": [[str(label), str(lunch)] for label, lunch in choices],
         "votes": {str(k): int(v) for k, v in state.get("votes", {}).items()},
         "counts": counts,
@@ -684,6 +685,7 @@ def _deserialize_poll_state(raw: dict) -> Optional[dict]:
         return None
     spreadsheet_id = str(raw.get("spreadsheet_id", "")).strip()
     spreadsheet_url = str(raw.get("spreadsheet_url", "")).strip()
+    spreadsheet_title = str(raw.get("spreadsheet_title", "")).strip()
     if not spreadsheet_id:
         return None
 
@@ -732,6 +734,7 @@ def _deserialize_poll_state(raw: dict) -> Optional[dict]:
     return {
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
+        "spreadsheet_title": spreadsheet_title,
         "choices": choices,
         "votes": votes,
         "counts": counts,
@@ -789,7 +792,7 @@ def create_poll_state(
     creator_user_id: Optional[str] = None,
 ):
     poll_choices = list(choices or CHOICES)
-    spreadsheet_id, spreadsheet_url = create_new_spreadsheet(
+    spreadsheet_id, spreadsheet_url, spreadsheet_title = create_new_spreadsheet(
         SHEETS,
         DRIVE,
         poll_title=poll_title,
@@ -802,6 +805,7 @@ def create_poll_state(
     return {
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
+        "spreadsheet_title": spreadsheet_title,
         "choices": poll_choices,
         "votes": {},               # user_id -> choice_idx
         "counts": [0] * len(poll_choices),
@@ -1233,6 +1237,45 @@ async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     native_items.sort(key=_sort_key, reverse=True)
 
+    missing_title_ids = []
+    for _, state in native_items:
+        if state.get("spreadsheet_title"):
+            continue
+        spreadsheet_id = str(state.get("spreadsheet_id", "") or "").strip()
+        if spreadsheet_id:
+            missing_title_ids.append(spreadsheet_id)
+
+    if missing_title_ids:
+        loop = asyncio.get_running_loop()
+
+        def _fetch_titles(ids: list[str]) -> dict[str, str]:
+            out: dict[str, str] = {}
+            seen: set[str] = set()
+            for spreadsheet_id in ids:
+                if spreadsheet_id in seen:
+                    continue
+                seen.add(spreadsheet_id)
+                try:
+                    meta = DRIVE.files().get(fileId=spreadsheet_id, fields="name").execute()
+                    name = str(meta.get("name", "") or "").strip()
+                    if name:
+                        out[spreadsheet_id] = name
+                except Exception as e:
+                    print("Sheet title lookup failed for", spreadsheet_id, ":", e)
+            return out
+
+        fetched_titles = await loop.run_in_executor(None, lambda: _fetch_titles(missing_title_ids))
+        if fetched_titles:
+            updated = False
+            for _, state in native_items:
+                spreadsheet_id = str(state.get("spreadsheet_id", "") or "").strip()
+                title = fetched_titles.get(spreadsheet_id, "")
+                if title and not state.get("spreadsheet_title"):
+                    state["spreadsheet_title"] = title
+                    updated = True
+            if updated:
+                save_native_poll_states()
+
     lines = [f"Tracked native poll sheets: {len(native_items)}"]
     if DRIVE_FOLDER_ID:
         folder_url = DRIVE_FOLDER_ID
@@ -1255,13 +1298,16 @@ async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 count_val = int(counts[i])
             except (IndexError, TypeError, ValueError):
                 count_val = 0
-            count_parts.append(f"{i+1}:{label}={count_val}")
+            count_parts.append(f"Option {i+1}:{label}={count_val}")
 
         lines.append("")
         lines.append(f"poll_id={poll_id}")
         lines.append(f"status={status} total_votes={total_votes}")
-        lines.append(f"chat_id={state.get('chat_id', '-')}, message_id={state.get('message_id', '-')}")
-        lines.append("counts=" + " | ".join(count_parts))
+        spreadsheet_title = str(state.get("spreadsheet_title", "") or "").strip()
+        if not spreadsheet_title:
+            spreadsheet_title = f"(sheet id: {state.get('spreadsheet_id', '-')})"
+        lines.append(f"sheet={spreadsheet_title}")
+        lines.append("counts: \n" + " \n ".join(count_parts))
         if state.get("spreadsheet_url"):
             lines.append(str(state["spreadsheet_url"]))
 
