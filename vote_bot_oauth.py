@@ -8,7 +8,7 @@ import csv
 import time
 import json
 from itertools import zip_longest
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
@@ -273,11 +273,12 @@ def create_new_spreadsheet(
     creator_user_id: Optional[str] = None,
 ) -> tuple[str, str]:
     choices = choices or CHOICES
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%SZ")
+    sgt = timezone(timedelta(hours=8))
+    ts = datetime.now(sgt).strftime("%Y-%m-%d_%H%M%S%z")
     title = f"VoteBot_{ts}"
     suffix = _compact_sheet_title_part(poll_title or "")
     if suffix:
-        title = f"{title}_{suffix}"
+        title = f"{suffix}_{title}"
 
     body = {
         "properties": {"title": title},
@@ -1002,8 +1003,8 @@ async def sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     await msg.reply_text(
-        "Copy-paste this below:\n"
-        "Minimally title and date fields should be filled. \n\n"
+        "Minimally, title and date fields should be filled. \n"
+        "Copy-paste this below:\n\n"
         f"{PUBLISHPOLL_SAMPLE_TEMPLATE}"
     )
 
@@ -1186,7 +1187,8 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
     handle = f"@{username}" if username else full_name
     newcomer_value = classify_newcomer(MEMBER_INDEX, username, full_name)
     gender_value = lookup_member_gender(MEMBER_INDEX, username)
-    ts = datetime.now(timezone.utc).isoformat()
+    sgt = timezone(timedelta(hours=8))
+    ts = datetime.now(sgt).isoformat()
 
     row_chat_id = poll_state.get("chat_id", "native")
     row_message_id = poll_state.get("message_id", answer.poll_id)
@@ -1382,7 +1384,8 @@ async def on_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     newcomer_value = classify_newcomer(MEMBER_INDEX, username, full_name)
     gender_value = lookup_member_gender(MEMBER_INDEX, username)
 
-    ts = datetime.now(timezone.utc).isoformat()
+    sgt = timezone(timedelta(hours=8))
+    ts = datetime.now(sgt).isoformat()
 
     # Run Google writes in a thread (so Telegram loop stays responsive)
     def _write():
