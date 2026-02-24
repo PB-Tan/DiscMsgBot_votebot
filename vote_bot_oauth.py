@@ -1234,6 +1234,11 @@ async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     native_items.sort(key=_sort_key, reverse=True)
 
     lines = [f"Tracked native poll sheets: {len(native_items)}"]
+    if DRIVE_FOLDER_ID:
+        folder_url = DRIVE_FOLDER_ID
+        if not re.match(r"^https?://", folder_url, flags=re.IGNORECASE):
+            folder_url = f"https://drive.google.com/drive/folders/{folder_url}"
+        lines.append(f"Drive folder: {folder_url}")
     for poll_id, state in native_items:
         choices = list(state.get("choices") or CHOICES)
         counts = list(state.get("counts") or [])
