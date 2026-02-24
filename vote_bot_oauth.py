@@ -73,14 +73,16 @@ VOTES_HEADERS = [
 ]
 
 PUBLISHPOLL_SAMPLE_TEMPLATE = (
+    "Copy and paste below\n"
+    "\publishpoll\n"
     "title=DAYWA Discussions\n"
     "desc=Join us for an afternoon...\n"
     "date=23 Feb 2026\n"
     "venue=Balestier Road\n"
     "lunch=12:30-2pm\n"
     "session=2-4pm\n"
-    "option1=discussion session only (default value)\n"
-    "option2=discussion session + lunch (default value)\n"
+    "option1=discussion session only\n"
+    "option2=discussion session + lunch\n"
 )
 
 
@@ -989,10 +991,9 @@ def vote_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Ready.\n"
-        "Use /vote to post the 2-option vote.\n"
         "Use /publishpoll to send a forwardable native Telegram poll (supports cap=).\n"
         "Use /sample to get a copy-paste template for /publishpoll.\n"
-        "A new spreadsheet is created per poll message (inline: on send, /vote: on first vote)."
+        "A new spreadsheet is created per poll message (inline: on send, native poll: on publish)."
     )
 
 
@@ -1048,10 +1049,6 @@ async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_
     )
 
 
-async def vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Please vote:", reply_markup=vote_keyboard())
-
-
 async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -1060,11 +1057,9 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_body = extract_command_body(msg.text or "", "publishpoll")
     if not raw_body.strip():
         await msg.reply_text(
-            "Usage: /publishpoll + key=value lines.\n"
+            "Error: /publishpoll cannot have empty title and date.\n"
+            "Refer to /sample for copy and paste-ready template.\n"
             "Supports title/desc/date/venue/lunch/session/cap and option1/option2.\n\n"
-            "Example:\n"
-            f"{PUBLISHPOLL_SAMPLE_TEMPLATE}"
-            "cap=40\n"
         )
         return
 
@@ -1483,7 +1478,6 @@ def build_telegram_application() -> Application:
     telegram_app = Application.builder().token(BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("sample", sample))
-    telegram_app.add_handler(CommandHandler("vote", vote))
     telegram_app.add_handler(CommandHandler("publishpoll", publishpoll))
     telegram_app.add_handler(PollAnswerHandler(on_native_poll_answer))
     telegram_app.add_handler(CallbackQueryHandler(on_vote))
