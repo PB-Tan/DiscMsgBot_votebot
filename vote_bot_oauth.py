@@ -1877,9 +1877,82 @@ def webhook_url_path(url: str) -> str:
     return path or "webhook"
 
 
+def webhook_health_paths(url: str) -> list[str]:
+    webhook_path = "/" + webhook_url_path(url).strip("/")
+    candidates = ["/health", f"{webhook_path}/health"]
+    seen: set[str] = set()
+    out: list[str] = []
+    for path in candidates:
+        normalized = "/" + path.strip("/")
+        if normalized not in seen:
+            seen.add(normalized)
+            out.append(normalized)
+    return out
+
+
+def install_ptb_webhook_health_routes(url: str) -> list[str]:
+    """
+    Patch PTB 20.x internal Tornado webhook app to expose health endpoints.
+
+    This keeps using Application.run_webhook() (simple for Render) while adding
+    GET/HEAD endpoints for uptime pings.
+    """
+    health_paths = webhook_health_paths(url)
+    try:
+        import tornado.web
+        from telegram.ext import _updater as ptb_updater  # internal PTB module
+        from telegram.ext._utils import webhookhandler as ptb_webhookhandler  # internal PTB module
+    except Exception as e:
+        print("Webhook health patch unavailable:", e)
+        return health_paths
+
+    base_cls = ptb_webhookhandler.WebhookAppClass
+    if getattr(base_cls, "_votebot_health_patch", False):
+        return health_paths
+
+    class _HealthHandler(tornado.web.RequestHandler):
+        def _write_body(self):
+            self.set_header("Content-Type", "application/json")
+            self.finish(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "service": "votebot",
+                        "ts_utc": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+            )
+
+        def get(self):
+            self._write_body()
+
+        def head(self):
+            self.set_status(200)
+            self.finish()
+
+    class _WebhookAppWithHealth(base_cls):
+        _votebot_health_patch = True
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            extra_handlers = [
+                (rf"{re.escape(path)}/?", _HealthHandler)
+                for path in health_paths
+            ]
+            # Add health handlers after PTB registers the webhook route.
+            self.add_handlers(r".*$", extra_handlers)
+
+    ptb_webhookhandler.WebhookAppClass = _WebhookAppWithHealth
+    ptb_updater.WebhookAppClass = _WebhookAppWithHealth
+    return health_paths
+
+
 def main():
     initialize_runtime_services()
     telegram_app = build_telegram_application()
+    health_paths = install_ptb_webhook_health_routes(TELEGRAM_WEBHOOK_URL)
+    if health_paths:
+        print("Health endpoints:", ", ".join(health_paths))
 
     # PTB's built-in webhook server is enough for Render (no Flask/FastAPI needed).
     # Render assigns PORT and expects the service to bind to 0.0.0.0.
