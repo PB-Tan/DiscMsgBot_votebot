@@ -83,6 +83,7 @@ PUBLISHPOLL_SAMPLE_TEMPLATE = (
     "session=2-4pm\n"
     "option1=discussion session only\n"
     "option2=discussion session + lunch\n"
+    "cap=40\n\n"
 )
 
 
@@ -991,9 +992,9 @@ def vote_keyboard():
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Ready.\n"
-        "Use /publishpoll to send a forwardable native Telegram poll (supports cap=).\n"
+        "Use /publishpoll to send a forwardable native Telegram poll.\n"
         "Use /sample to get a copy-paste template for /publishpoll.\n"
-        "A new spreadsheet is created per poll message (inline: on send, native poll: on publish)."
+        "A new spreadsheet is created per poll message."
     )
 
 
