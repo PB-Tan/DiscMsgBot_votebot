@@ -1106,7 +1106,7 @@ def _condense_poll_question(raw_body: str, max_len: int = 300) -> str:
     if not parts:
         return (extract_poll_title(raw_body) or "Please vote").strip()[:max_len]
 
-    question = " | ".join(parts)
+    question = "\n".join(parts)
     if len(question) <= max_len:
         return question
 
@@ -1117,7 +1117,7 @@ def _condense_poll_question(raw_body: str, max_len: int = 300) -> str:
 
     out = title
     for part in parts[1:]:
-        candidate = f"{out} | {part}"
+        candidate = f"{out}\n{part}"
         if len(candidate) > max_len:
             break
         out = candidate
@@ -1391,7 +1391,10 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     preview_lines = ["Preview only (not published yet)"]
     if context_preview:
         preview_lines.extend(["", "Poll details:", context_preview])
-    preview_lines.extend(["", "Native poll preview:", f"Question: {poll_question}"])
+    else:
+        preview_lines.extend(["", "Poll question:", poll_question])
+    preview_lines.append("")
+    preview_lines.append("Options:")
     for i, option in enumerate(poll_options, start=1):
         preview_lines.append(f"{i}. {option}")
     if poll_cap > 0:
