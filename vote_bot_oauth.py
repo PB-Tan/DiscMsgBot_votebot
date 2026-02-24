@@ -1138,6 +1138,7 @@ async def _send_native_poll_and_track(
     poll_metadata = extract_poll_metadata(raw_body)
     poll_choices = extract_native_poll_choices(raw_body)
     poll_cap = extract_poll_cap(raw_body)
+    spreadsheet_title = (poll_metadata.get("title") or extract_poll_title(raw_body) or poll_question).strip()
     creator_handle = f"@{actor_user.username}" if actor_user and getattr(actor_user, "username", None) else ""
     creator_user_id = str(actor_user.id) if actor_user else ""
     poll_options = [label for label, _ in poll_choices]
@@ -1160,7 +1161,7 @@ async def _send_native_poll_and_track(
         None,
         lambda: create_poll_state(
             poll_key,
-            poll_title=poll_question,
+            poll_title=spreadsheet_title,
             choices=poll_choices,
             cap=poll_cap,
             poll_metadata=poll_metadata,
