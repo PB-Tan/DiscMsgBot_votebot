@@ -73,8 +73,7 @@ VOTES_HEADERS = [
 ]
 
 PUBLISHPOLL_SAMPLE_TEMPLATE = (
-    "Copy and paste below\n"
-    "\publishpoll\n"
+    "/publishpoll\n"
     "title=DAYWA Discussions\n"
     "desc=Join us for an afternoon...\n"
     "date=23 Feb 2026\n"
@@ -1003,7 +1002,8 @@ async def sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     await msg.reply_text(
-        "Copy-paste this after /publishpoll:\n"
+        "Copy-paste this below:\n"
+        "Minimally title and date fields should be filled. \n\n"
         f"{PUBLISHPOLL_SAMPLE_TEMPLATE}"
     )
 
@@ -1058,9 +1058,8 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_body = extract_command_body(msg.text or "", "publishpoll")
     if not raw_body.strip():
         await msg.reply_text(
-            "Error: /publishpoll cannot have empty title and date.\n"
-            "Refer to /sample for copy and paste-ready template.\n"
-            "Minimally requires title=xxx and date=xxx fields.\n\n"
+            "Usage: /publishpoll cannot have empty title and date.\n"
+            "Refer to /sample for copy and paste-ready template.\n\n"
         )
         return
 
