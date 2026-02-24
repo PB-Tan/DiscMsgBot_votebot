@@ -75,8 +75,8 @@ VOTES_HEADERS = [
 PUBLISHPOLL_SAMPLE_TEMPLATE = (
     "/publishpoll\n"
     "title=DAYWA Discussions\n"
-    "desc=Join us for an afternoon...\n"
     "date=23 Feb 2026\n"
+    "desc=Join us for an afternoon...\n"
     "venue=Balestier Road\n"
     "lunch=12:30-2pm\n"
     "session=2-4pm\n"
@@ -1094,6 +1094,39 @@ def _preview_plain_text(value: str, parse_mode: Optional[str]) -> str:
     return text.strip()
 
 
+def _condense_poll_question(raw_body: str, max_len: int = 300) -> str:
+    poll_prompt, parse_mode = build_poll_prompt(raw_body)
+    context_text = strip_prompt_line(poll_prompt, parse_mode)
+    plain = _preview_plain_text(context_text, parse_mode)
+
+    if not plain:
+        return (extract_poll_title(raw_body) or "Please vote").strip()[:max_len]
+
+    parts = [line.strip() for line in plain.splitlines() if line.strip()]
+    if not parts:
+        return (extract_poll_title(raw_body) or "Please vote").strip()[:max_len]
+
+    question = " | ".join(parts)
+    if len(question) <= max_len:
+        return question
+
+    # Keep title first, then append as much detail as fits.
+    title = parts[0]
+    if len(title) >= max_len:
+        return title[: max_len - 1].rstrip() + "…"
+
+    out = title
+    for part in parts[1:]:
+        candidate = f"{out} | {part}"
+        if len(candidate) > max_len:
+            break
+        out = candidate
+
+    if out == title and len(question) > max_len:
+        return title[: max_len - 1].rstrip() + "…"
+    return out
+
+
 async def _send_native_poll_and_track(
     context: ContextTypes.DEFAULT_TYPE,
     *,
@@ -1101,18 +1134,13 @@ async def _send_native_poll_and_track(
     raw_body: str,
     actor_user,
 ):
-    poll_prompt, parse_mode = build_poll_prompt(raw_body)
-    context_text = strip_prompt_line(poll_prompt, parse_mode)
-    poll_question = (extract_poll_title(raw_body) or "Please vote").strip()
+    poll_question = _condense_poll_question(raw_body)
     poll_metadata = extract_poll_metadata(raw_body)
     poll_choices = extract_native_poll_choices(raw_body)
     poll_cap = extract_poll_cap(raw_body)
     creator_handle = f"@{actor_user.username}" if actor_user and getattr(actor_user, "username", None) else ""
     creator_user_id = str(actor_user.id) if actor_user else ""
     poll_options = [label for label, _ in poll_choices]
-
-    if context_text:
-        await context.bot.send_message(chat_id=chat_id, text=context_text, parse_mode=parse_mode)
 
     poll_msg = await context.bot.send_poll(
         chat_id=chat_id,
@@ -1168,6 +1196,7 @@ async def sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await msg.reply_text(
         "Minimally, title and date fields should be filled. \n"
+        "Supports option3 and option4, if values are provided. \n"
         "Copy-paste this below:\n\n"
         f"{PUBLISHPOLL_SAMPLE_TEMPLATE}"
     )
@@ -1347,14 +1376,13 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not raw_body.strip():
         await msg.reply_text(
             "Usage: /publishpoll cannot have empty title and date.\n"
-            "Supports option1..option4 (option3/option4 are optional).\n"
             "Refer to /sample for copy and paste-ready template.\n\n"
         )
         return
 
     poll_prompt, parse_mode = build_poll_prompt(raw_body)
     context_text = strip_prompt_line(poll_prompt, parse_mode)
-    poll_question = (extract_poll_title(raw_body) or "Please vote").strip()
+    poll_question = _condense_poll_question(raw_body)
     poll_choices = extract_native_poll_choices(raw_body)
     poll_cap = extract_poll_cap(raw_body)
     poll_options = [label for label, _ in poll_choices]
@@ -1362,7 +1390,7 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     preview_lines = ["Preview only (not published yet)"]
     if context_preview:
-        preview_lines.extend(["", "Message preview:", context_preview])
+        preview_lines.extend(["", "Poll details:", context_preview])
     preview_lines.extend(["", "Native poll preview:", f"Question: {poll_question}"])
     for i, option in enumerate(poll_options, start=1):
         preview_lines.append(f"{i}. {option}")
