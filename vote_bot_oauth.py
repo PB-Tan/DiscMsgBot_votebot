@@ -1060,7 +1060,7 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(
             "Error: /publishpoll cannot have empty title and date.\n"
             "Refer to /sample for copy and paste-ready template.\n"
-            "Supports title/desc/date/venue/lunch/session/cap and option1/option2.\n\n"
+            "Minimally requires title=xxx and date=xxx fields.\n\n"
         )
         return
 
