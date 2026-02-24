@@ -202,10 +202,26 @@ def extract_poll_metadata(raw_text: str) -> dict[str, str]:
         "choice 2": "option2",
         "answer2": "option2",
         "answer 2": "option2",
+        "option3": "option3",
+        "option 3": "option3",
+        "choice3": "option3",
+        "choice 3": "option3",
+        "answer3": "option3",
+        "answer 3": "option3",
+        "option4": "option4",
+        "option 4": "option4",
+        "choice4": "option4",
+        "choice 4": "option4",
+        "answer4": "option4",
+        "answer 4": "option4",
         "lunch1": "lunch1",
         "lunch 1": "lunch1",
         "lunch2": "lunch2",
         "lunch 2": "lunch2",
+        "lunch3": "lunch3",
+        "lunch 3": "lunch3",
+        "lunch4": "lunch4",
+        "lunch 4": "lunch4",
     }
     out: dict[str, str] = {}
     for part in parts:
@@ -233,14 +249,11 @@ def build_poll_info_rows(
     meta = dict(poll_metadata or {})
     if poll_title and not meta.get("title"):
         meta["title"] = poll_title
-    if not meta.get("option1"):
-        meta["option1"] = choices[0][0]
-    if not meta.get("option2"):
-        meta["option2"] = choices[1][0]
-    if not meta.get("lunch1"):
-        meta["lunch1"] = choices[0][1]
-    if not meta.get("lunch2"):
-        meta["lunch2"] = choices[1][1]
+    for i, (label, lunch) in enumerate(choices[:4], start=1):
+        if not meta.get(f"option{i}"):
+            meta[f"option{i}"] = label
+        if not meta.get(f"lunch{i}"):
+            meta[f"lunch{i}"] = lunch
 
     rows = [
         ["Key", "Value"],
@@ -257,8 +270,12 @@ def build_poll_info_rows(
         ["cap", meta.get("cap", "")],
         ["option1", meta.get("option1", "")],
         ["option2", meta.get("option2", "")],
+        ["option3", meta.get("option3", "")],
+        ["option4", meta.get("option4", "")],
         ["lunch1", meta.get("lunch1", "")],
         ["lunch2", meta.get("lunch2", "")],
+        ["lunch3", meta.get("lunch3", "")],
+        ["lunch4", meta.get("lunch4", "")],
     ]
     return rows
 
@@ -336,12 +353,8 @@ def create_new_spreadsheet(
                 {"range": "Votes!A1:I1", "values": [VOTES_HEADERS]},
                 {"range": f"Poll Info!A1:B{len(poll_info_rows)}", "values": poll_info_rows},
                 {
-                    "range": "Tally!A1:B3",
-                    "values": [
-                        ["Option", "Count"],
-                        [choices[0][0], 0],
-                        [choices[1][0], 0],
-                    ],
+                    "range": f"Tally!A1:B{len(choices) + 1}",
+                    "values": [["Option", "Count"]] + [[label, 0] for label, _ in choices],
                 },
             ],
         },
@@ -360,12 +373,20 @@ def append_row(sheets, spreadsheet_id: str, range_a1: str, row: list):
     ).execute()
 
 
-def update_tally(sheets, spreadsheet_id: str, c0: int, c1: int):
+def update_tally(sheets, spreadsheet_id: str, choices: list[tuple[str, str]], counts: list[int]):
+    tally_rows = []
+    for i, (label, _) in enumerate(list(choices or CHOICES)):
+        try:
+            count = int(counts[i])
+        except (IndexError, TypeError, ValueError):
+            count = 0
+        tally_rows.append([label, count])
+
     sheets.spreadsheets().values().update(
         spreadsheetId=spreadsheet_id,
-        range="Tally!B2:B3",
+        range=f"Tally!A2:B{len(tally_rows) + 1}",
         valueInputOption="RAW",
-        body={"values": [[c0], [c1]]},
+        body={"values": tally_rows},
     ).execute()
 
 
@@ -611,20 +632,44 @@ def upsert_name_result(
 # Telegram bot
 # --------------------
 POLL_STATES = {}  # ("chat", chat_id, message_id) or ("inline", inline_message_id) -> state
+PENDING_PUBLISH_PREVIEWS = {}  # token -> {raw_body, chat_id, user_id, created_ts}
 MEMBER_INDEX = {"enabled": False, "source": "", "handles": set(), "names": {}}
 MEMBER_INDEX_LAST_REFRESH_TS = 0.0
 SHEETS = None
 DRIVE = None
+PUBLISH_PREVIEW_TTL_SECONDS = 15 * 60
+
+
+def _prune_pending_publish_previews() -> None:
+    now = time.time()
+    expired = []
+    for token, item in PENDING_PUBLISH_PREVIEWS.items():
+        try:
+            created_ts = float(item.get("created_ts", 0))
+        except (TypeError, ValueError, AttributeError):
+            created_ts = 0.0
+        if created_ts <= 0 or (now - created_ts) > PUBLISH_PREVIEW_TTL_SECONDS:
+            expired.append(token)
+    for token in expired:
+        PENDING_PUBLISH_PREVIEWS.pop(token, None)
 
 
 def _serialize_poll_state(state: dict) -> dict:
-    choices = state.get("choices", CHOICES)
+    choices = list(state.get("choices") or CHOICES)
+    choice_count = max(2, len(choices))
+    raw_counts = list(state.get("counts", []))
+    counts = []
+    for i in range(choice_count):
+        try:
+            counts.append(int(raw_counts[i]))
+        except (IndexError, TypeError, ValueError):
+            counts.append(0)
     return {
         "spreadsheet_id": str(state.get("spreadsheet_id", "")),
         "spreadsheet_url": str(state.get("spreadsheet_url", "")),
         "choices": [[str(label), str(lunch)] for label, lunch in choices],
         "votes": {str(k): int(v) for k, v in state.get("votes", {}).items()},
-        "counts": [int(x) for x in list(state.get("counts", [0, 0]))[:2]],
+        "counts": counts,
         "names_row_by_user": {str(k): int(v) for k, v in state.get("names_row_by_user", {}).items()},
         "next_names_row": int(state.get("next_names_row", 2)),
         "chat_id": str(state.get("chat_id", "")),
@@ -644,11 +689,13 @@ def _deserialize_poll_state(raw: dict) -> Optional[dict]:
 
     raw_choices = raw.get("choices") or CHOICES
     choices = []
-    for item in raw_choices[:2]:
+    for item in list(raw_choices)[:4]:
         if isinstance(item, (list, tuple)) and len(item) >= 2:
             choices.append((str(item[0]), str(item[1])))
-    if len(choices) != 2:
+    if len(choices) < 2:
         choices = list(CHOICES)
+    else:
+        choices = choices[:4]
 
     votes = {}
     for k, v in (raw.get("votes") or {}).items():
@@ -664,11 +711,13 @@ def _deserialize_poll_state(raw: dict) -> Optional[dict]:
         except (TypeError, ValueError):
             continue
 
-    counts = raw.get("counts") or [0, 0]
-    try:
-        counts = [int(counts[0]), int(counts[1])]
-    except (IndexError, TypeError, ValueError):
-        counts = [0, 0]
+    raw_counts = list(raw.get("counts") or [])
+    counts = []
+    for i in range(len(choices)):
+        try:
+            counts.append(int(raw_counts[i]))
+        except (IndexError, TypeError, ValueError):
+            counts.append(0)
 
     try:
         next_names_row = int(raw.get("next_names_row", 2))
@@ -755,7 +804,7 @@ def create_poll_state(
         "spreadsheet_url": spreadsheet_url,
         "choices": poll_choices,
         "votes": {},               # user_id -> choice_idx
-        "counts": [0, 0],
+        "counts": [0] * len(poll_choices),
         "names_row_by_user": {},   # user_id -> row number
         "next_names_row": 2,
         "cap": int(cap or 0),
@@ -801,10 +850,26 @@ def extract_native_poll_choices(raw_text: str) -> list[tuple[str, str]]:
         "choice 2": "option2",
         "answer2": "option2",
         "answer 2": "option2",
+        "option3": "option3",
+        "option 3": "option3",
+        "choice3": "option3",
+        "choice 3": "option3",
+        "answer3": "option3",
+        "answer 3": "option3",
+        "option4": "option4",
+        "option 4": "option4",
+        "choice4": "option4",
+        "choice 4": "option4",
+        "answer4": "option4",
+        "answer 4": "option4",
         "lunch1": "lunch1",
         "lunch 1": "lunch1",
         "lunch2": "lunch2",
         "lunch 2": "lunch2",
+        "lunch3": "lunch3",
+        "lunch 3": "lunch3",
+        "lunch4": "lunch4",
+        "lunch 4": "lunch4",
     }
     for part in parts:
         sep = "=" if "=" in part else ":"
@@ -815,10 +880,15 @@ def extract_native_poll_choices(raw_text: str) -> list[tuple[str, str]]:
         value = value.strip()
         if key and value:
             parsed[key] = value
-    return [
+    out = [
         (parsed.get("option1", CHOICES[0][0]), parsed.get("lunch1", CHOICES[0][1])),
         (parsed.get("option2", CHOICES[1][0]), parsed.get("lunch2", CHOICES[1][1])),
     ]
+    if parsed.get("option3"):
+        out.append((parsed["option3"], parsed.get("lunch3", "")))
+    if parsed.get("option4"):
+        out.append((parsed["option4"], parsed.get("lunch4", "")))
+    return out[:4]
 
 
 def extract_poll_cap(raw_text: str) -> int:
@@ -901,10 +971,26 @@ def build_poll_prompt(query_text: str) -> tuple[str, Optional[str]]:
         "choice 2": "option2",
         "answer2": "option2",
         "answer 2": "option2",
+        "option3": "option3",
+        "option 3": "option3",
+        "choice3": "option3",
+        "choice 3": "option3",
+        "answer3": "option3",
+        "answer 3": "option3",
+        "option4": "option4",
+        "option 4": "option4",
+        "choice4": "option4",
+        "choice 4": "option4",
+        "answer4": "option4",
+        "answer 4": "option4",
         "lunch1": "lunch1",
         "lunch 1": "lunch1",
         "lunch2": "lunch2",
         "lunch 2": "lunch2",
+        "lunch3": "lunch3",
+        "lunch 3": "lunch3",
+        "lunch4": "lunch4",
+        "lunch 4": "lunch4",
     }
     fields: dict[str, str] = {}
     free_lines: list[str] = []
@@ -989,11 +1075,89 @@ def vote_keyboard():
     ])
 
 
+def publishpoll_preview_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Publish", callback_data=f"ppc|{token}|ok"),
+            InlineKeyboardButton("Cancel", callback_data=f"ppc|{token}|cancel"),
+        ]
+    ])
+
+
+def _preview_plain_text(value: str, parse_mode: Optional[str]) -> str:
+    text = (value or "").strip()
+    if not text:
+        return ""
+    if parse_mode == "HTML":
+        text = re.sub(r"<[^>]+>", "", text)
+        text = html.unescape(text)
+    return text.strip()
+
+
+async def _send_native_poll_and_track(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    chat_id,
+    raw_body: str,
+    actor_user,
+):
+    poll_prompt, parse_mode = build_poll_prompt(raw_body)
+    context_text = strip_prompt_line(poll_prompt, parse_mode)
+    poll_question = (extract_poll_title(raw_body) or "Please vote").strip()
+    poll_metadata = extract_poll_metadata(raw_body)
+    poll_choices = extract_native_poll_choices(raw_body)
+    poll_cap = extract_poll_cap(raw_body)
+    creator_handle = f"@{actor_user.username}" if actor_user and getattr(actor_user, "username", None) else ""
+    creator_user_id = str(actor_user.id) if actor_user else ""
+    poll_options = [label for label, _ in poll_choices]
+
+    if context_text:
+        await context.bot.send_message(chat_id=chat_id, text=context_text, parse_mode=parse_mode)
+
+    poll_msg = await context.bot.send_poll(
+        chat_id=chat_id,
+        question=poll_question[:300],
+        options=poll_options,
+        is_anonymous=False,
+        allows_multiple_answers=False,
+    )
+
+    native_poll = getattr(poll_msg, "poll", None)
+    if not (native_poll and native_poll.id):
+        return None
+
+    poll_key = ("native", native_poll.id)
+    loop = asyncio.get_running_loop()
+    poll_state = await loop.run_in_executor(
+        None,
+        lambda: create_poll_state(
+            poll_key,
+            poll_title=poll_question,
+            choices=poll_choices,
+            cap=poll_cap,
+            poll_metadata=poll_metadata,
+            creator_handle=creator_handle,
+            creator_user_id=creator_user_id,
+        ),
+    )
+    poll_state["chat_id"] = str(poll_msg.chat_id)
+    poll_state["message_id"] = str(poll_msg.message_id)
+    POLL_STATES[poll_key] = poll_state
+    save_native_poll_states()
+    await context.bot.send_message(
+        chat_id=chat_id,
+        text=f"Tracking sheet (internal circulation): {poll_state['spreadsheet_url']}",
+    )
+    return poll_state
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Ready.\n"
-        "Use /publishpoll to send a forwardable native Telegram poll.\n"
+        "Use /publishpoll to preview then send a native Telegram poll.\n"
         "Use /sample to get a copy-paste template for /publishpoll.\n"
+        "Use /activesheets to list tracked native poll sheets.\n"
+        "Use /forgetpoll <poll_id> to remove stale tracking.\n"
         "A new spreadsheet is created per poll message."
     )
 
@@ -1007,6 +1171,129 @@ async def sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Copy-paste this below:\n\n"
         f"{PUBLISHPOLL_SAMPLE_TEMPLATE}"
     )
+
+
+async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    native_items = []
+    for key, state in POLL_STATES.items():
+        if isinstance(key, tuple) and len(key) == 2 and key[0] == "native":
+            native_items.append((str(key[1]), state))
+
+    if not native_items:
+        await msg.reply_text("No tracked native poll sheets found.")
+        return
+
+    def _sort_key(item):
+        poll_id, state = item
+        try:
+            message_id = int(state.get("message_id", 0))
+        except (TypeError, ValueError):
+            message_id = 0
+        return (message_id, poll_id)
+
+    native_items.sort(key=_sort_key, reverse=True)
+
+    lines = [f"Tracked native poll sheets: {len(native_items)}"]
+    for poll_id, state in native_items:
+        choices = list(state.get("choices") or CHOICES)
+        counts = list(state.get("counts") or [])
+        votes = state.get("votes") or {}
+        total_votes = len(votes)
+        cap = int(state.get("cap", 0) or 0)
+        status = "closed" if state.get("closed") else "open"
+        if cap > 0:
+            status += f" (cap={cap})"
+
+        count_parts = []
+        for i, (label, _) in enumerate(choices):
+            try:
+                count_val = int(counts[i])
+            except (IndexError, TypeError, ValueError):
+                count_val = 0
+            count_parts.append(f"{i+1}:{label}={count_val}")
+
+        lines.append("")
+        lines.append(f"poll_id={poll_id}")
+        lines.append(f"status={status} total_votes={total_votes}")
+        lines.append(f"chat_id={state.get('chat_id', '-')}, message_id={state.get('message_id', '-')}")
+        lines.append("counts=" + " | ".join(count_parts))
+        if state.get("spreadsheet_url"):
+            lines.append(str(state["spreadsheet_url"]))
+
+    text = "\n".join(lines)
+    if len(text) <= 4000:
+        await msg.reply_text(text)
+        return
+
+    chunk_lines = []
+    chunk_len = 0
+    for line in lines:
+        line_len = len(line) + 1
+        if chunk_lines and chunk_len + line_len > 3800:
+            await msg.reply_text("\n".join(chunk_lines))
+            chunk_lines = [line]
+            chunk_len = line_len
+            continue
+        chunk_lines.append(line)
+        chunk_len += line_len
+    if chunk_lines:
+        await msg.reply_text("\n".join(chunk_lines))
+
+
+async def forgetpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    raw_arg = extract_command_body(msg.text or "", "forgetpoll").strip()
+    if not raw_arg:
+        await msg.reply_text(
+            "Usage: /forgetpoll <poll_id>\n"
+            "Tip: use /activesheets to copy a poll_id.\n"
+            "This removes local tracking only (does not delete the Telegram poll or Google Sheet)."
+        )
+        return
+
+    poll_id = raw_arg.split()[0].strip()
+    if poll_id.lower().startswith("poll_id="):
+        poll_id = poll_id.split("=", 1)[1].strip()
+    poll_id = poll_id.strip(",.;")
+    if not poll_id:
+        await msg.reply_text("Invalid poll_id. Use /activesheets to copy a valid one.")
+        return
+
+    matched_key = None
+    matched_state = None
+    for key, state in POLL_STATES.items():
+        if not (isinstance(key, tuple) and len(key) == 2 and key[0] == "native"):
+            continue
+        if str(key[1]) == poll_id:
+            matched_key = key
+            matched_state = state
+            break
+
+    if matched_key is None:
+        await msg.reply_text(f"Tracked poll not found: {poll_id}")
+        return
+
+    POLL_STATES.pop(matched_key, None)
+    save_native_poll_states()
+
+    spreadsheet_url = ""
+    if isinstance(matched_state, dict):
+        spreadsheet_url = str(matched_state.get("spreadsheet_url", "") or "")
+
+    reply = [
+        f"Removed tracking for poll_id={poll_id}.",
+        "Telegram poll and Google Sheet were not deleted.",
+    ]
+    if spreadsheet_url:
+        reply.append(spreadsheet_url)
+    await msg.reply_text("\n".join(reply))
 
 
 async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1060,6 +1347,7 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not raw_body.strip():
         await msg.reply_text(
             "Usage: /publishpoll cannot have empty title and date.\n"
+            "Supports option1..option4 (option3/option4 are optional).\n"
             "Refer to /sample for copy and paste-ready template.\n\n"
         )
         return
@@ -1067,45 +1355,93 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll_prompt, parse_mode = build_poll_prompt(raw_body)
     context_text = strip_prompt_line(poll_prompt, parse_mode)
     poll_question = (extract_poll_title(raw_body) or "Please vote").strip()
-    poll_metadata = extract_poll_metadata(raw_body)
     poll_choices = extract_native_poll_choices(raw_body)
     poll_cap = extract_poll_cap(raw_body)
-    creator_handle = f"@{msg.from_user.username}" if msg.from_user and msg.from_user.username else ""
-    creator_user_id = str(msg.from_user.id) if msg.from_user else ""
     poll_options = [label for label, _ in poll_choices]
+    context_preview = _preview_plain_text(context_text, parse_mode)
 
-    if context_text:
-        await msg.reply_text(context_text, parse_mode=parse_mode)
+    preview_lines = ["Preview only (not published yet)"]
+    if context_preview:
+        preview_lines.extend(["", "Message preview:", context_preview])
+    preview_lines.extend(["", "Native poll preview:", f"Question: {poll_question}"])
+    for i, option in enumerate(poll_options, start=1):
+        preview_lines.append(f"{i}. {option}")
+    if poll_cap > 0:
+        preview_lines.append(f"Cap: {poll_cap}")
+    preview_lines.extend(["", "Publish this poll?"])
 
-    poll_msg = await context.bot.send_poll(
-        chat_id=msg.chat_id,
-        question=poll_question[:300],
-        options=poll_options,
-        is_anonymous=False,
-        allows_multiple_answers=False,
+    _prune_pending_publish_previews()
+    token = uuid.uuid4().hex
+    PENDING_PUBLISH_PREVIEWS[token] = {
+        "raw_body": raw_body,
+        "chat_id": str(msg.chat_id),
+        "user_id": str(msg.from_user.id) if msg.from_user else "",
+        "created_ts": time.time(),
+    }
+    await msg.reply_text(
+        "\n".join(preview_lines),
+        reply_markup=publishpoll_preview_keyboard(token),
     )
 
-    native_poll = getattr(poll_msg, "poll", None)
-    if native_poll and native_poll.id:
-        poll_key = ("native", native_poll.id)
-        loop = asyncio.get_running_loop()
-        poll_state = await loop.run_in_executor(
-            None,
-            lambda: create_poll_state(
-                poll_key,
-                poll_title=poll_question,
-                choices=poll_choices,
-                cap=poll_cap,
-                poll_metadata=poll_metadata,
-                creator_handle=creator_handle,
-                creator_user_id=creator_user_id,
-            ),
+
+async def on_publishpoll_preview_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    parts = (query.data or "").split("|")
+    if len(parts) != 3 or parts[0] != "ppc":
+        await query.answer()
+        return
+
+    _, token, action = parts
+    _prune_pending_publish_previews()
+    pending = PENDING_PUBLISH_PREVIEWS.get(token)
+    if not pending:
+        await query.answer("Preview expired. Run /publishpoll again.", show_alert=True)
+        return
+
+    requester_id = str(pending.get("user_id", ""))
+    actor_id = str(query.from_user.id) if query.from_user else ""
+    if requester_id and actor_id and requester_id != actor_id:
+        await query.answer("Only the requester can confirm/cancel.", show_alert=True)
+        return
+
+    if action == "cancel":
+        PENDING_PUBLISH_PREVIEWS.pop(token, None)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.answer("Cancelled")
+        if query.message:
+            await query.message.reply_text("Cancelled. Poll was not published.")
+        return
+
+    if action != "ok":
+        await query.answer()
+        return
+
+    PENDING_PUBLISH_PREVIEWS.pop(token, None)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    await query.answer("Publishing...")
+    if not query.message:
+        return
+
+    try:
+        await _send_native_poll_and_track(
+            context,
+            chat_id=query.message.chat_id,
+            raw_body=str(pending.get("raw_body", "")),
+            actor_user=query.from_user,
         )
-        poll_state["chat_id"] = str(poll_msg.chat_id)
-        poll_state["message_id"] = str(poll_msg.message_id)
-        POLL_STATES[poll_key] = poll_state
-        save_native_poll_states()
-        await msg.reply_text(f"Tracking sheet (internal circulation): {poll_state['spreadsheet_url']}")
+    except Exception as e:
+        print("Publish from preview failed:", e)
+        await query.message.reply_text(f"Publish failed: {e}")
 
 
 async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1231,8 +1567,8 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
         lambda: update_tally(
             SHEETS,
             poll_state["spreadsheet_id"],
-            poll_state["counts"][0],
-            poll_state["counts"][1],
+            poll_state.get("choices", CHOICES),
+            poll_state.get("counts", [0, 0]),
         ),
     )
     save_native_poll_states()
@@ -1413,8 +1749,8 @@ async def on_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lambda: update_tally(
             SHEETS,
             poll_state["spreadsheet_id"],
-            poll_state["counts"][0],
-            poll_state["counts"][1],
+            poll_state.get("choices", CHOICES),
+            poll_state.get("counts", [0, 0]),
         ),
     )
 
@@ -1481,9 +1817,12 @@ def build_telegram_application() -> Application:
     telegram_app = Application.builder().token(BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("sample", sample))
+    telegram_app.add_handler(CommandHandler("activesheets", activesheets))
+    telegram_app.add_handler(CommandHandler("forgetpoll", forgetpoll))
     telegram_app.add_handler(CommandHandler("publishpoll", publishpoll))
     telegram_app.add_handler(PollAnswerHandler(on_native_poll_answer))
-    telegram_app.add_handler(CallbackQueryHandler(on_vote))
+    telegram_app.add_handler(CallbackQueryHandler(on_publishpoll_preview_action, pattern=r"^ppc\|"))
+    telegram_app.add_handler(CallbackQueryHandler(on_vote, pattern=r"^v\|"))
     telegram_app.add_handler(InlineQueryHandler(inline_query))
     telegram_app.add_handler(ChosenInlineResultHandler(on_chosen_inline_result))
     return telegram_app
