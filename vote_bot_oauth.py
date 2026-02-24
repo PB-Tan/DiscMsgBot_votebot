@@ -1173,9 +1173,15 @@ async def _send_native_poll_and_track(
     poll_state["message_id"] = str(poll_msg.message_id)
     POLL_STATES[poll_key] = poll_state
     save_native_poll_states()
+    confirmation_lines = [f"Tracking sheet (internal circulation): {poll_state['spreadsheet_url']}"]
+    if DRIVE_FOLDER_ID:
+        folder_url = DRIVE_FOLDER_ID
+        if not re.match(r"^https?://", folder_url, flags=re.IGNORECASE):
+            folder_url = f"https://drive.google.com/drive/folders/{folder_url}"
+        confirmation_lines.append(f"Drive folder: {folder_url}")
     await context.bot.send_message(
         chat_id=chat_id,
-        text=f"Tracking sheet (internal circulation): {poll_state['spreadsheet_url']}",
+        text="\n".join(confirmation_lines),
     )
     return poll_state
 
