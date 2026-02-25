@@ -11,12 +11,12 @@ from itertools import zip_longest
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 from urllib.parse import urlparse
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InlineQueryResultArticle, InputTextMessageContent
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     ContextTypes
 )
-from telegram.ext import InlineQueryHandler, ChosenInlineResultHandler, PollAnswerHandler
+from telegram.ext import PollAnswerHandler
 import uuid
 
 from google.auth.transport.requests import Request
@@ -81,6 +81,14 @@ PROFILE_OPTIONS = [
     "Newcomer",
     "Enhanced Facilitation",
     "Facilitator",
+]
+
+TALLY_STATUS_ORDER = [
+    "Signed up",
+    "Invite sent",
+    "Confirmed",
+    "Pulled out",
+    "Waitlisted",
 ]
 
 VOTES_HEADERS = [
@@ -382,6 +390,7 @@ def create_new_spreadsheet(
             ],
         },
     ).execute()
+    write_tally_status_summary(sheets, spreadsheet_id)
 
     # Add dropdown validation for Names!D:D (Sign up status), starting from row 2.
     names_sheet_id = None
@@ -460,6 +469,32 @@ def now_utc8_date_time() -> tuple[str, str]:
     return now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")
 
 
+def build_tally_status_rows() -> list[list[str]]:
+    status_range = "Names!D:D"
+    rows = [["Sign up status", "Count"]]
+    for status_name in TALLY_STATUS_ORDER:
+        if status_name == "Signed up":
+            formula = (
+                f'=COUNTIF({status_range},"Signed up")'
+                f'+COUNTIF({status_range},"Invite sent")'
+                f'+COUNTIF({status_range},"Confirmed")'
+            )
+        else:
+            formula = f'=COUNTIF({status_range},"{status_name}")'
+        rows.append([status_name, formula])
+    return rows
+
+
+def write_tally_status_summary(sheets, spreadsheet_id: str):
+    status_rows = build_tally_status_rows()
+    sheets.spreadsheets().values().update(
+        spreadsheetId=spreadsheet_id,
+        range=f"Tally!D1:E{len(status_rows)}",
+        valueInputOption="USER_ENTERED",
+        body={"values": status_rows},
+    ).execute()
+
+
 def update_tally(sheets, spreadsheet_id: str, choices: list[tuple[str, str]], counts: list[int]):
     tally_rows = []
     for i, (label, _) in enumerate(list(choices or CHOICES)):
@@ -475,6 +510,7 @@ def update_tally(sheets, spreadsheet_id: str, choices: list[tuple[str, str]], co
         valueInputOption="RAW",
         body={"values": tally_rows},
     ).execute()
+    write_tally_status_summary(sheets, spreadsheet_id)
 
 
 POLL_INFO_KEY_ROWS = {
@@ -749,7 +785,7 @@ def upsert_name_result(
 # --------------------
 # Telegram bot
 # --------------------
-POLL_STATES = {}  # ("chat", chat_id, message_id) or ("inline", inline_message_id) -> state
+POLL_STATES = {}  # ("native", poll_id) -> state
 PENDING_PUBLISH_PREVIEWS = {}  # token -> {raw_body, chat_id, user_id, created_ts}
 MEMBER_INDEX = {"enabled": False, "source": "", "handles": set(), "names": {}}
 MEMBER_INDEX_LAST_REFRESH_TS = 0.0
@@ -1175,33 +1211,6 @@ def build_poll_prompt(query_text: str) -> tuple[str, Optional[str]]:
     return "Please vote:\n" + "\n".join(parts), None
 
 
-def build_inline_result_preview(poll_prompt: str) -> tuple[str, str]:
-    # Telegram inline result cards only have title + description, so collapse the
-    # formatted poll message into a compact preview.
-    plain = re.sub(r"<[^>]+>", "", poll_prompt)
-    plain = html.unescape(plain)
-    lines = [line.strip() for line in plain.splitlines() if line.strip()]
-
-    if not lines or lines == ["Please vote:"]:
-        return (
-            "Template keys: title/date/venue/lunch/session/desc",
-            "Use new lines: title=... / desc=... / date=... / venue=... / lunch=... / session=...",
-        )
-
-    title_line = next((x for x in lines if x.lower() != "please vote:"), "Discussion vote (2 options)")
-    remaining = [x for x in lines if x != title_line]
-    description = " • ".join(remaining) if remaining else "Tap to send this vote"
-
-    return title_line[:64], description[:100]
-
-
-def vote_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(CHOICES[0][0], callback_data="v|0")],
-        [InlineKeyboardButton(CHOICES[1][0], callback_data="v|1")],
-    ])
-
-
 def publishpoll_preview_keyboard(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -1341,6 +1350,7 @@ async def sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(
         "Minimally, title and date fields should be filled. \n"
         "Supports option3 and option4, if values are provided. \n"
+        "If cap values are provided, poll will automatically close on reaching max cap\n"
         "Copy-paste this below:\n\n"
         f"{PUBLISHPOLL_SAMPLE_TEMPLATE}"
     )
@@ -1723,48 +1733,6 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text("\n".join(reply))
 
 
-async def inline_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query_text = update.inline_query.query or ""
-    poll_prompt, parse_mode = build_poll_prompt(query_text)
-    preview_title, preview_desc = build_inline_result_preview(poll_prompt)
-
-    result = InlineQueryResultArticle(
-        id=str(uuid.uuid4()),
-        title=preview_title,
-        description=preview_desc,
-        input_message_content=InputTextMessageContent(poll_prompt, parse_mode=parse_mode),
-        reply_markup=vote_keyboard(),  # your existing keyboard
-    )
-    await update.inline_query.answer([result], cache_time=0)
-
-
-async def on_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chosen = update.chosen_inline_result
-    if not chosen or not chosen.inline_message_id:
-        return
-
-    poll_key = ("inline", chosen.inline_message_id)
-    if poll_key in POLL_STATES:
-        return
-
-    loop = asyncio.get_running_loop()
-    raw_query = chosen.query or ""
-    poll_title = extract_poll_title(raw_query)
-    poll_metadata = extract_poll_metadata(raw_query)
-    creator_handle = f"@{chosen.from_user.username}" if getattr(chosen, "from_user", None) and chosen.from_user.username else ""
-    creator_user_id = str(chosen.from_user.id) if getattr(chosen, "from_user", None) and chosen.from_user else ""
-    POLL_STATES[poll_key] = await loop.run_in_executor(
-        None,
-        lambda: create_poll_state(
-            poll_key,
-            poll_title=poll_title,
-            poll_metadata=poll_metadata,
-            creator_handle=creator_handle,
-            creator_user_id=creator_user_id,
-        ),
-    )
-
-
 async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -2032,165 +2000,6 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
                 print("Native poll auto-close failed:", e)
 
 
-async def on_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    msg = query.message
-    user = query.from_user
-    inline_msg_id = query.inline_message_id
-    if not msg and not inline_msg_id:
-        return
-
-    parts = (query.data or "").split("|")
-    if len(parts) != 2 or parts[0] != "v":
-        return
-
-    try:
-        idx = int(parts[1])
-    except ValueError:
-        return
-    if idx < 0 or idx >= len(CHOICES):
-        return
-
-    loop = asyncio.get_running_loop()
-
-    if msg:
-        poll_key = ("chat", msg.chat_id, msg.message_id)
-    else:
-        poll_key = ("inline", inline_msg_id)
-
-    poll_state = POLL_STATES.get(poll_key)
-    if poll_state is None:
-        fallback_title = None
-        fallback_metadata = None
-        creator_handle = f"@{user.username}" if user and user.username else ""
-        creator_user_id = str(user.id) if user else ""
-        if msg and getattr(msg, "text", None):
-            msg_text = msg.text or ""
-            first_line = msg_text.splitlines()[0].strip()
-            if first_line and first_line.lower() != "please vote:":
-                fallback_title = first_line
-                fallback_metadata = {"title": fallback_title}
-            parsed_meta = extract_poll_metadata(msg_text)
-            if parsed_meta:
-                fallback_metadata = {**(fallback_metadata or {}), **parsed_meta}
-        poll_state = await loop.run_in_executor(
-            None,
-            lambda: create_poll_state(
-                poll_key,
-                poll_title=fallback_title,
-                poll_metadata=fallback_metadata,
-                creator_handle=creator_handle,
-                creator_user_id=creator_user_id,
-            ),
-        )
-        POLL_STATES[poll_key] = poll_state
-
-    global MEMBER_INDEX, MEMBER_INDEX_LAST_REFRESH_TS
-    if MEMBER_RAW_SOURCE or MEMBER_CHECK_SOURCE:
-        now = time.time()
-        refresh_due = (
-            MEMBER_INDEX_LAST_REFRESH_TS <= 0
-            or MEMBER_CHECK_REFRESH_SECONDS <= 0
-            or (now - MEMBER_INDEX_LAST_REFRESH_TS) >= MEMBER_CHECK_REFRESH_SECONDS
-        )
-        if refresh_due:
-            try:
-                if MEMBER_RAW_SOURCE:
-                    MEMBER_INDEX = await loop.run_in_executor(
-                        None,
-                        lambda: load_member_check_index_from_raw_source(SHEETS, MEMBER_RAW_SOURCE),
-                    )
-                else:
-                    MEMBER_INDEX = await loop.run_in_executor(
-                        None,
-                        lambda: load_member_check_index_from_sheet(SHEETS, MEMBER_CHECK_SOURCE, MEMBER_CHECK_TAB),
-                    )
-                MEMBER_INDEX_LAST_REFRESH_TS = time.time()
-            except Exception as e:
-                print("Member check live refresh failed:", e)
-
-    prev_idx = poll_state["votes"].get(user.id)  # None if first vote
-
-    # Same option clicked again => cancel
-    if prev_idx is not None and prev_idx == idx:
-        del poll_state["votes"][user.id]
-        poll_state["counts"][idx] -= 1
-
-        action = "Cancelled vote"
-        new_choice_text = "CANCELLED"
-        new_lunch = ""
-        reply_text = "Cancelled your vote."
-
-    # Different option clicked => change
-    elif prev_idx is not None and prev_idx != idx:
-        poll_state["votes"][user.id] = idx
-        poll_state["counts"][prev_idx] -= 1
-        poll_state["counts"][idx] += 1
-
-        action = f"Changed vote: {CHOICES[prev_idx][0]} -> {CHOICES[idx][0]}"
-        new_choice_text, new_lunch = CHOICES[idx][0], CHOICES[idx][1]
-        reply_text = f"Changed: {new_choice_text} ✅"
-
-    # First vote
-    else:
-        poll_state["votes"][user.id] = idx
-        poll_state["counts"][idx] += 1
-
-        action = "Recorded vote"
-        new_choice_text, new_lunch = CHOICES[idx][0], CHOICES[idx][1]
-        reply_text = f"Recorded: {new_choice_text} ✅"
-
-    # Build user fields
-    username = user.username or ""
-    full_name = (user.full_name or "").strip()
-    username_link = f"https://t.me/{username}" if username else ""
-    handle = f"@{username}" if username else full_name
-    newcomer_value = classify_newcomer(MEMBER_INDEX, username, full_name)
-    gender_value = lookup_member_gender(MEMBER_INDEX, username)
-
-    row_date, row_time = now_utc8_date_time()
-
-    # Run Google writes in a thread (so Telegram loop stays responsive)
-    def _write():
-        append_row(
-            SHEETS,
-            poll_state["spreadsheet_id"],
-            "Votes!A:H",
-            [row_date, row_time, str(user.id), username, full_name, new_choice_text, new_lunch, action],
-        )
-
-        upsert_name_result(
-            SHEETS,
-            poll_state["spreadsheet_id"],
-            poll_state,
-            user_id=user.id,
-            username_link=username_link,
-            full_name=full_name,
-            handle=handle,
-            status="Pulled out" if new_choice_text == "CANCELLED" else "Signed up",
-            selected_option=new_choice_text,
-            lunch=new_lunch,
-            gender=gender_value,
-            newcomer=newcomer_value,
-        )
-
-    await loop.run_in_executor(None, _write)
-
-    await loop.run_in_executor(
-        None,
-        lambda: update_tally(
-            SHEETS,
-            poll_state["spreadsheet_id"],
-            poll_state.get("choices", CHOICES),
-            poll_state.get("counts", [0, 0]),
-        ),
-    )
-
-    if msg:
-        await msg.reply_text(reply_text)
-
 def initialize_runtime_services():
     global SHEETS, DRIVE, MEMBER_INDEX, MEMBER_INDEX_LAST_REFRESH_TS
 
@@ -2257,7 +2066,6 @@ def build_telegram_application() -> Application:
     telegram_app.add_handler(CommandHandler("publishpoll", publishpoll))
     telegram_app.add_handler(PollAnswerHandler(on_native_poll_answer))
     telegram_app.add_handler(CallbackQueryHandler(on_publishpoll_preview_action, pattern=r"^ppc\|"))
-    telegram_app.add_handler(CallbackQueryHandler(on_vote, pattern=r"^v\|"))
     return telegram_app
 
 
