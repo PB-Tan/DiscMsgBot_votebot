@@ -61,6 +61,7 @@ NAMES_HEADERS = [
     "Name (auto)",
     "TG Handle (auto)",
     "Sign up status \n[Signed up, Invite sent, Confirmed, Pulled out, Waitlisted]",
+    "Chosen Option (auto)",
     "Lunch\n[Yes, No]",
     "Profile ",
     "Gender",
@@ -349,7 +350,7 @@ def create_new_spreadsheet(
         body={
             "valueInputOption": "RAW",
             "data": [
-                {"range": "Names!A1:I1", "values": [NAMES_HEADERS]},
+                {"range": "Names!A1:J1", "values": [NAMES_HEADERS]},
                 {"range": "Votes!A1:I1", "values": [VOTES_HEADERS]},
                 {"range": f"Poll Info!A1:B{len(poll_info_rows)}", "values": poll_info_rows},
                 {
@@ -585,6 +586,7 @@ def upsert_name_result(
     full_name: str,
     handle: str,
     status: str,
+    selected_option: str,
     lunch: str,
     gender: str,
     newcomer: str,
@@ -595,18 +597,18 @@ def upsert_name_result(
         poll_state["names_row_by_user"][user_id] = row_num
         poll_state["next_names_row"] += 1
 
-    # Update A:E, H, I and optionally G (gender). F is preserved for manual profile edits.
+    # Update A:F, I, J and optionally H (gender). G is preserved for manual profile edits.
     data = [
         {
-            "range": f"Names!A{row_num}:E{row_num}",
-            "values": [[username_link, full_name, handle, status, lunch]],
-        },
-        {
-            "range": f"Names!H{row_num}:H{row_num}",
-            "values": [[newcomer]],
+            "range": f"Names!A{row_num}:F{row_num}",
+            "values": [[username_link, full_name, handle, status, selected_option, lunch]],
         },
         {
             "range": f"Names!I{row_num}:I{row_num}",
+            "values": [[newcomer]],
+        },
+        {
+            "range": f"Names!J{row_num}:J{row_num}",
             "values": [[""]],
         },
     ]
@@ -614,7 +616,7 @@ def upsert_name_result(
         data.insert(
             1,
             {
-                "range": f"Names!G{row_num}:G{row_num}",
+                "range": f"Names!H{row_num}:H{row_num}",
                 "values": [[gender]],
             },
         )
@@ -1196,6 +1198,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use /publishpoll to preview then send a native Telegram poll.\n"
         "Use /sample to get a copy-paste template for /publishpoll.\n"
         "Use /activesheets to list tracked native poll sheets.\n"
+        "Use /pollstatus [poll_id ...] to check tracked/open/closed status.\n"
+        "Use /stoppoll <poll_id> to close a native poll (no more voting/edits).\n"
         "Use /forgetpoll <poll_id> to remove stale tracking.\n"
         "A new spreadsheet is created per poll message."
     )
@@ -1302,12 +1306,13 @@ async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines.append("")
         lines.append(f"poll_id={poll_id}")
-        lines.append(f"status={status} total_votes={total_votes}")
+        lines.append(f"status={status}")
         spreadsheet_title = str(state.get("spreadsheet_title", "") or "").strip()
         if not spreadsheet_title:
             spreadsheet_title = f"(sheet id: {state.get('spreadsheet_id', '-')})"
         lines.append(f"sheet={spreadsheet_title}")
-        lines.append("counts: \n" + " \n ".join(count_parts))
+        lines.append(f"total_votes={total_votes}")
+        lines.append("breakdown: \n" + "\n".join(count_parts))
         if state.get("spreadsheet_url"):
             lines.append(str(state["spreadsheet_url"]))
 
@@ -1378,6 +1383,204 @@ async def forgetpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Removed tracking for poll_id={poll_id}.",
         "Telegram poll and Google Sheet were not deleted.",
     ]
+    if spreadsheet_url:
+        reply.append(spreadsheet_url)
+    await msg.reply_text("\n".join(reply))
+
+
+async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    raw_arg = extract_command_body(msg.text or "", "pollstatus").strip()
+
+    native_items = []
+    for key, state in POLL_STATES.items():
+        if isinstance(key, tuple) and len(key) == 2 and key[0] == "native":
+            native_items.append((str(key[1]), state))
+
+    tracked_map = {poll_id: state for poll_id, state in native_items}
+
+    # Per-poll lookup mode: /pollstatus <poll_id> [poll_id...]
+    if raw_arg:
+        raw_parts = raw_arg.replace("\n", " ").split()
+        poll_ids = []
+        seen: set[str] = set()
+        for part in raw_parts:
+            poll_id = part.strip()
+            if poll_id.lower().startswith("poll_id="):
+                poll_id = poll_id.split("=", 1)[1].strip()
+            poll_id = poll_id.strip(",.;")
+            if not poll_id or poll_id in seen:
+                continue
+            seen.add(poll_id)
+            poll_ids.append(poll_id)
+
+        if not poll_ids:
+            await msg.reply_text(
+                "Usage: /pollstatus [poll_id ...]\n"
+                "Without arguments: shows tracked poll summary.\n"
+                "With poll_id(s): shows tracked/untracked and open/closed (if tracked)."
+            )
+            return
+
+        lines = ["Poll status lookup:"]
+        for poll_id in poll_ids:
+            state = tracked_map.get(poll_id)
+            if not isinstance(state, dict):
+                lines.append(f"poll_id={poll_id} status=untracked")
+                continue
+
+            status = "closed" if state.get("closed") else "open"
+            votes = state.get("votes") or {}
+            total_votes = len(votes) if isinstance(votes, dict) else 0
+            cap = int(state.get("cap", 0) or 0)
+            line = f"poll_id={poll_id} status=tracked/{status} total_votes={total_votes}"
+            if cap > 0:
+                line += f" cap={cap}"
+            lines.append(line)
+
+            sheet_title = str(state.get("spreadsheet_title", "") or "").strip()
+            if sheet_title:
+                lines.append(f"sheet={sheet_title}")
+            elif state.get("spreadsheet_id"):
+                lines.append(f"sheet_id={state.get('spreadsheet_id')}")
+        lines.append("")
+        lines.append(
+            "Note: untracked polls cannot be checked for open/closed status because local tracking is missing."
+        )
+        await msg.reply_text("\n".join(lines))
+        return
+
+    # Summary mode: /pollstatus
+    open_ids = []
+    closed_ids = []
+    for poll_id, state in native_items:
+        if isinstance(state, dict) and state.get("closed"):
+            closed_ids.append(poll_id)
+        else:
+            open_ids.append(poll_id)
+
+    def _poll_sort_key(poll_id: str):
+        state = tracked_map.get(poll_id) or {}
+        try:
+            message_id = int(state.get("message_id", 0))
+        except (TypeError, ValueError):
+            message_id = 0
+        return (message_id, poll_id)
+
+    open_ids.sort(key=_poll_sort_key, reverse=True)
+    closed_ids.sort(key=_poll_sort_key, reverse=True)
+
+    lines = [
+        "Native poll tracking status:",
+        f"tracked_total={len(native_items)}",
+        f"tracked_open={len(open_ids)}",
+        f"tracked_closed={len(closed_ids)}",
+        "untracked=not enumerable (use /pollstatus <poll_id>)",
+    ]
+
+    if open_ids:
+        lines.append("")
+        lines.append("Open tracked poll_ids:")
+        for poll_id in open_ids:
+            lines.append(f"- {poll_id}")
+
+    if closed_ids:
+        lines.append("")
+        lines.append("Closed tracked poll_ids:")
+        for poll_id in closed_ids:
+            lines.append(f"- {poll_id}")
+
+    if not native_items:
+        lines.append("")
+        lines.append("No tracked native polls found.")
+
+    text = "\n".join(lines)
+    if len(text) <= 4000:
+        await msg.reply_text(text)
+        return
+
+    chunk_lines = []
+    chunk_len = 0
+    for line in lines:
+        line_len = len(line) + 1
+        if chunk_lines and chunk_len + line_len > 3800:
+            await msg.reply_text("\n".join(chunk_lines))
+            chunk_lines = [line]
+            chunk_len = line_len
+            continue
+        chunk_lines.append(line)
+        chunk_len += line_len
+    if chunk_lines:
+        await msg.reply_text("\n".join(chunk_lines))
+
+
+async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    raw_arg = extract_command_body(msg.text or "", "stoppoll").strip()
+    if not raw_arg:
+        await msg.reply_text(
+            "Usage: /stoppoll <poll_id>\n"
+            "Tip: use /activesheets to copy a poll_id.\n"
+            "This closes the Telegram poll so participants can no longer vote or edit their vote."
+        )
+        return
+
+    poll_id = raw_arg.split()[0].strip()
+    if poll_id.lower().startswith("poll_id="):
+        poll_id = poll_id.split("=", 1)[1].strip()
+    poll_id = poll_id.strip(",.;")
+    if not poll_id:
+        await msg.reply_text("Invalid poll_id. Use /activesheets to copy a valid one.")
+        return
+
+    matched_key = None
+    matched_state = None
+    for key, state in POLL_STATES.items():
+        if not (isinstance(key, tuple) and len(key) == 2 and key[0] == "native"):
+            continue
+        if str(key[1]) == poll_id:
+            matched_key = key
+            matched_state = state
+            break
+
+    if matched_key is None or not isinstance(matched_state, dict):
+        await msg.reply_text(f"Tracked poll not found: {poll_id}")
+        return
+
+    if matched_state.get("closed"):
+        await msg.reply_text(f"Poll already closed: {poll_id}")
+        return
+
+    chat_id = matched_state.get("chat_id")
+    message_id_raw = matched_state.get("message_id")
+    try:
+        message_id = int(message_id_raw)
+    except (TypeError, ValueError):
+        message_id = None
+
+    if not chat_id or message_id is None:
+        await msg.reply_text(
+            f"Cannot stop poll_id={poll_id}: missing tracked Telegram message id/chat id."
+        )
+        return
+
+    try:
+        await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        await msg.reply_text(f"Failed to stop poll_id={poll_id}: {e}")
+        return
+
+    matched_state["closed"] = True
+    save_native_poll_states()
+
+    reply = [f"Closed poll_id={poll_id}.", "Participants can no longer vote or edit their vote."]
+    spreadsheet_url = str(matched_state.get("spreadsheet_url", "") or "")
     if spreadsheet_url:
         reply.append(spreadsheet_url)
     await msg.reply_text("\n".join(reply))
@@ -1645,6 +1848,7 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
             full_name=full_name,
             handle=handle,
             status="Pulled out" if new_choice_text == "CANCELLED" else "Signed up",
+            selected_option=new_choice_text,
             lunch=new_lunch,
             gender=gender_value,
             newcomer=newcomer_value,
@@ -1826,6 +2030,7 @@ async def on_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
             full_name=full_name,
             handle=handle,
             status="Pulled out" if new_choice_text == "CANCELLED" else "Signed up",
+            selected_option=new_choice_text,
             lunch=new_lunch,
             gender=gender_value,
             newcomer=newcomer_value,
@@ -1907,13 +2112,13 @@ def build_telegram_application() -> Application:
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("sample", sample))
     telegram_app.add_handler(CommandHandler("activesheets", activesheets))
+    telegram_app.add_handler(CommandHandler("pollstatus", pollstatus))
+    telegram_app.add_handler(CommandHandler("stoppoll", stoppoll))
     telegram_app.add_handler(CommandHandler("forgetpoll", forgetpoll))
     telegram_app.add_handler(CommandHandler("publishpoll", publishpoll))
     telegram_app.add_handler(PollAnswerHandler(on_native_poll_answer))
     telegram_app.add_handler(CallbackQueryHandler(on_publishpoll_preview_action, pattern=r"^ppc\|"))
     telegram_app.add_handler(CallbackQueryHandler(on_vote, pattern=r"^v\|"))
-    telegram_app.add_handler(InlineQueryHandler(inline_query))
-    telegram_app.add_handler(ChosenInlineResultHandler(on_chosen_inline_result))
     return telegram_app
 
 
