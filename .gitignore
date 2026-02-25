@@ -9,3 +9,4 @@ test-discmsgbot-7742f7d11711.json
 test_gsheet.py
 test_oauth_create_sheet.py
 test-discmsgbot*.json
+native_poll_states.json
