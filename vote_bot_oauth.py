@@ -70,7 +70,7 @@ NAMES_HEADERS = [
 ]
 
 VOTES_HEADERS = [
-    "ts_utc", "chat_id", "message_id", "user_id", "username", "full_name", "choice", "lunch", "action"
+    "date_utc8", "time_utc8", "user_id", "username", "full_name", "choice", "lunch", "action"
 ]
 
 PUBLISHPOLL_SAMPLE_TEMPLATE = (
@@ -359,7 +359,7 @@ def create_new_spreadsheet(
             "valueInputOption": "RAW",
             "data": [
                 {"range": "Names!A1:J1", "values": [NAMES_HEADERS]},
-                {"range": "Votes!A1:I1", "values": [VOTES_HEADERS]},
+                {"range": "Votes!A1:H1", "values": [VOTES_HEADERS]},
                 {"range": f"Poll Info!A1:B{len(poll_info_rows)}", "values": poll_info_rows},
                 {
                     "range": f"Tally!A1:B{len(choices) + 1}",
@@ -380,6 +380,12 @@ def append_row(sheets, spreadsheet_id: str, range_a1: str, row: list):
         insertDataOption="INSERT_ROWS",
         body={"values": [row]},
     ).execute()
+
+
+def now_utc8_date_time() -> tuple[str, str]:
+    utc8 = timezone(timedelta(hours=8))
+    now = datetime.now(utc8)
+    return now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")
 
 
 def update_tally(sheets, spreadsheet_id: str, choices: list[tuple[str, str]], counts: list[int]):
@@ -1242,7 +1248,7 @@ async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use /publishpoll to preview then send a native Telegram poll.\n"
         "Use /sample to get a copy-paste template for /publishpoll.\n"
         "Use /pollstatus [poll_id ...] to check tracked/open/closed status.\n"
-        "Use /stoppoll <poll_id> to close a native poll and stop tracking it.\n"
+        "Use /stoppoll <poll_id> to close a poll and stop tracking it.\n"
         "A new spreadsheet is created per poll published."
     )
 
@@ -1527,22 +1533,13 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = [
         "Poll tracking status:",
-        f"tracked_total={len(native_items)}",
-        f"tracked_open={len(open_ids)}",
-        f"tracked_closed={len(closed_ids)}",
-        "Use /pollstatus <poll_id> to check untracked polls",
+        f"total active polls={len(open_ids)}",
     ]
 
     if open_ids:
         lines.append("")
-        lines.append("Open tracked poll_ids:")
+        lines.append("Active poll_ids:")
         for poll_id in open_ids:
-            lines.append(f"- {poll_id}")
-
-    if closed_ids:
-        lines.append("")
-        lines.append("Closed tracked poll_ids:")
-        for poll_id in closed_ids:
             lines.append(f"- {poll_id}")
 
     if not native_items:
@@ -1579,7 +1576,7 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(
             "Usage: /stoppoll <poll_id>\n"
             "Tip: use /pollstatus to list tracked poll_ids.\n"
-            "This closes the Telegram poll and removes local tracking."
+            "This closes the Telegram poll and prevents voting"
         )
         return
 
@@ -1883,21 +1880,16 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
     handle = f"@{username}" if username else full_name
     newcomer_value = classify_newcomer(MEMBER_INDEX, username, full_name)
     gender_value = lookup_member_gender(MEMBER_INDEX, username)
-    sgt = timezone(timedelta(hours=8))
-    ts = datetime.now(sgt).isoformat()
-
-    row_chat_id = poll_state.get("chat_id", "native")
-    row_message_id = poll_state.get("message_id", answer.poll_id)
+    row_date, row_time = now_utc8_date_time()
 
     def _write():
         append_row(
             SHEETS,
             poll_state["spreadsheet_id"],
-            "Votes!A:I",
+            "Votes!A:H",
             [
-                ts,
-                row_chat_id,
-                row_message_id,
+                row_date,
+                row_time,
                 str(user.id),
                 username,
                 full_name,
@@ -1993,12 +1985,8 @@ async def on_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if msg:
         poll_key = ("chat", msg.chat_id, msg.message_id)
-        row_chat_id = str(msg.chat_id)
-        row_message_id = str(msg.message_id)
     else:
         poll_key = ("inline", inline_msg_id)
-        row_chat_id = "inline"
-        row_message_id = inline_msg_id
 
     poll_state = POLL_STATES.get(poll_key)
     if poll_state is None:
@@ -2090,13 +2078,16 @@ async def on_vote(update: Update, context: ContextTypes.DEFAULT_TYPE):
     newcomer_value = classify_newcomer(MEMBER_INDEX, username, full_name)
     gender_value = lookup_member_gender(MEMBER_INDEX, username)
 
-    sgt = timezone(timedelta(hours=8))
-    ts = datetime.now(sgt).isoformat()
+    row_date, row_time = now_utc8_date_time()
 
     # Run Google writes in a thread (so Telegram loop stays responsive)
     def _write():
-        append_row(SHEETS, poll_state["spreadsheet_id"], "Votes!A:I",
-                   [ts, row_chat_id, row_message_id, str(user.id), username, full_name, new_choice_text, new_lunch, action])
+        append_row(
+            SHEETS,
+            poll_state["spreadsheet_id"],
+            "Votes!A:H",
+            [row_date, row_time, str(user.id), username, full_name, new_choice_text, new_lunch, action],
+        )
 
         upsert_name_result(
             SHEETS,
