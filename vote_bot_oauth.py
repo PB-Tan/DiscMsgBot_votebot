@@ -246,6 +246,8 @@ def build_poll_info_rows(
     choices: list[tuple[str, str]],
     creator_handle: Optional[str] = None,
     creator_user_id: Optional[str] = None,
+    poll_id: Optional[str] = None,
+    poll_status: str = "open",
 ) -> list[list[str]]:
     meta = dict(poll_metadata or {})
     if poll_title and not meta.get("title"):
@@ -262,6 +264,8 @@ def build_poll_info_rows(
         ["created_utc", created_utc],
         ["creator_handle", creator_handle or ""],
         ["creator_user_id", creator_user_id or ""],
+        ["poll_id", str(poll_id or "")],
+        ["status", (poll_status or "open").strip() or "open"],
         ["title", meta.get("title", "")],
         ["desc", meta.get("desc", "")],
         ["date", meta.get("date", "")],
@@ -289,6 +293,8 @@ def create_new_spreadsheet(
     poll_metadata: Optional[dict[str, str]] = None,
     creator_handle: Optional[str] = None,
     creator_user_id: Optional[str] = None,
+    poll_id: Optional[str] = None,
+    poll_status: str = "open",
 ) -> tuple[str, str, str]:
     choices = choices or CHOICES
     sgt = timezone(timedelta(hours=8))
@@ -344,6 +350,8 @@ def create_new_spreadsheet(
         choices=list(choices),
         creator_handle=creator_handle,
         creator_user_id=creator_user_id,
+        poll_id=poll_id,
+        poll_status=poll_status,
     )
     sheets.spreadsheets().values().batchUpdate(
         spreadsheetId=spreadsheet_id,
@@ -388,6 +396,36 @@ def update_tally(sheets, spreadsheet_id: str, choices: list[tuple[str, str]], co
         range=f"Tally!A2:B{len(tally_rows) + 1}",
         valueInputOption="RAW",
         body={"values": tally_rows},
+    ).execute()
+
+
+POLL_INFO_KEY_ROWS = {
+    "poll_id": 6,
+    "status": 7,
+}
+
+
+def update_poll_info_fields(sheets, spreadsheet_id: str, **fields: str):
+    data = []
+    for key, value in fields.items():
+        row_num = POLL_INFO_KEY_ROWS.get(str(key))
+        if not row_num:
+            continue
+        data.append(
+            {
+                "range": f"Poll Info!B{row_num}:B{row_num}",
+                "values": [[str(value or "")]],
+            }
+        )
+    if not data:
+        return
+
+    sheets.spreadsheets().values().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "valueInputOption": "RAW",
+            "data": data,
+        },
     ).execute()
 
 
@@ -794,6 +832,9 @@ def create_poll_state(
     creator_user_id: Optional[str] = None,
 ):
     poll_choices = list(choices or CHOICES)
+    native_poll_id = ""
+    if isinstance(poll_key, tuple) and len(poll_key) == 2 and poll_key[0] == "native":
+        native_poll_id = str(poll_key[1])
     spreadsheet_id, spreadsheet_url, spreadsheet_title = create_new_spreadsheet(
         SHEETS,
         DRIVE,
@@ -802,6 +843,8 @@ def create_poll_state(
         poll_metadata=poll_metadata,
         creator_handle=creator_handle,
         creator_user_id=creator_user_id,
+        poll_id=native_poll_id,
+        poll_status="open",
     )
     print("Spreadsheet created:", spreadsheet_url, "for", poll_key)
     return {
@@ -1185,6 +1228,7 @@ async def _send_native_poll_and_track(
         if not re.match(r"^https?://", folder_url, flags=re.IGNORECASE):
             folder_url = f"https://drive.google.com/drive/folders/{folder_url}"
         confirmation_lines.append(f"Drive folder: {folder_url}")
+    confirmation_lines.append(f"poll_id: {native_poll.id}")
     await context.bot.send_message(
         chat_id=chat_id,
         text="\n".join(confirmation_lines),
@@ -1588,6 +1632,16 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     matched_state["closed"] = True
     save_native_poll_states()
+    spreadsheet_id = str(matched_state.get("spreadsheet_id", "") or "")
+    if spreadsheet_id:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: update_poll_info_fields(SHEETS, spreadsheet_id, status="closed"),
+            )
+        except Exception as e:
+            print("Poll Info status update failed for stoppoll:", e)
 
     reply = [f"Closed poll_id={poll_id}.", "Participants can no longer vote or edit their vote."]
     spreadsheet_url = str(matched_state.get("spreadsheet_url", "") or "")
@@ -1890,6 +1944,15 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
                 await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
                 poll_state["closed"] = True
                 save_native_poll_states()
+                spreadsheet_id = str(poll_state.get("spreadsheet_id", "") or "")
+                if spreadsheet_id:
+                    try:
+                        await loop.run_in_executor(
+                            None,
+                            lambda: update_poll_info_fields(SHEETS, spreadsheet_id, status="closed"),
+                        )
+                    except Exception as e:
+                        print("Poll Info status update failed for auto-close:", e)
                 try:
                     await context.bot.send_message(
                         chat_id=chat_id,
