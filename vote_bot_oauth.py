@@ -1209,8 +1209,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ready.\n"
         "Use /publishpoll to preview then send a native Telegram poll.\n"
         "Use /sample to get a copy-paste template for /publishpoll.\n"
-        "Use /pollstatus [poll_id ...] to check tracked/open/closed status.\n"
-        "Use /stoppoll <poll_id> to close a native poll (no more voting/edits).\n"
+        "Use /pollstatus to check tracked/open/closed status for all polls.\n"
+        "Use /stoppoll <poll_id> to close a poll (no more voting/edits).\n"
         "A new spreadsheet is created per poll published."
     )
 
@@ -1484,11 +1484,11 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     closed_ids.sort(key=_poll_sort_key, reverse=True)
 
     lines = [
-        "Native poll tracking status:",
+        "Poll tracking status:",
         f"tracked_total={len(native_items)}",
         f"tracked_open={len(open_ids)}",
         f"tracked_closed={len(closed_ids)}",
-        "untracked=not enumerable (use /pollstatus <poll_id>)",
+        "Use /pollstatus <poll_id> to check untracked polls",
     ]
 
     if open_ids:
