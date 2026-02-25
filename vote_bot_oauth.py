@@ -83,6 +83,25 @@ PROFILE_OPTIONS = [
     "Facilitator",
 ]
 
+GROUPINGS_AUTOMATED_SHEET_TITLE = "Groupings (automated)"
+GROUPING_FACILITATOR_PROFILE_OPTIONS = [
+    "A. Experienced",
+    "B. Regular",
+    "C. New",
+]
+GROUPING_FACILITATOR_ACTIVE_OPTIONS = ["Yes", "No"]
+GROUPING_FACILITATOR_DEFAULT_ROWS = [
+    ("A. Experienced", "Yes"),
+    ("A. Experienced", "Yes"),
+    ("A. Experienced", "Yes"),
+    ("B. Regular", "Yes"),
+    ("B. Regular", "Yes"),
+    ("B. Regular", "Yes"),
+    ("B. Regular", "Yes"),
+    ("C. New", "Yes"),
+    ("C. New", "Yes"),
+]
+
 TALLY_STATUS_ORDER = [
     "Signed up",
     "Invite sent",
@@ -330,6 +349,7 @@ def create_new_spreadsheet(
         "properties": {"title": title},
         "sheets": [
             {"properties": {"title": "Names"}},
+            {"properties": {"title": GROUPINGS_AUTOMATED_SHEET_TITLE}},
             {"properties": {"title": "Votes"}},
             {"properties": {"title": "Tally"}},
             {"properties": {"title": "Poll Info"}},
@@ -391,62 +411,125 @@ def create_new_spreadsheet(
         },
     ).execute()
     write_tally_status_summary(sheets, spreadsheet_id)
+    write_groupings_automated_sheet(sheets, spreadsheet_id)
 
     # Add dropdown validation for Names!D:D (Sign up status), starting from row 2.
     names_sheet_id = None
+    groupings_sheet_id = None
     for sheet in ss.get("sheets", []):
         props = sheet.get("properties", {})
         if props.get("title") == "Names":
             names_sheet_id = props.get("sheetId")
-            break
+        if props.get("title") == GROUPINGS_AUTOMATED_SHEET_TITLE:
+            groupings_sheet_id = props.get("sheetId")
+
+    requests = []
     if names_sheet_id is not None:
+        requests.extend([
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": names_sheet_id,
+                        "startRowIndex": 1,
+                        "startColumnIndex": 3,
+                        "endColumnIndex": 4,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_LIST",
+                            "values": [
+                                {"userEnteredValue": option}
+                                for option in SIGNUP_STATUS_OPTIONS
+                            ],
+                        },
+                        "showCustomUi": True,
+                        "strict": True,
+                    },
+                }
+            },
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": names_sheet_id,
+                        "startRowIndex": 1,
+                        "startColumnIndex": 6,
+                        "endColumnIndex": 7,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_LIST",
+                            "values": [
+                                {"userEnteredValue": option}
+                                for option in PROFILE_OPTIONS
+                            ],
+                        },
+                        "showCustomUi": True,
+                        "strict": True,
+                    },
+                }
+            },
+        ])
+    if groupings_sheet_id is not None:
+        requests.extend([
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": groupings_sheet_id,
+                        "startRowIndex": 2,
+                        "endRowIndex": 200,
+                        "startColumnIndex": 1,
+                        "endColumnIndex": 2,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_LIST",
+                            "values": [
+                                {"userEnteredValue": option}
+                                for option in GROUPING_FACILITATOR_PROFILE_OPTIONS
+                            ],
+                        },
+                        "showCustomUi": True,
+                        "strict": True,
+                    },
+                }
+            },
+            {
+                "setDataValidation": {
+                    "range": {
+                        "sheetId": groupings_sheet_id,
+                        "startRowIndex": 2,
+                        "endRowIndex": 200,
+                        "startColumnIndex": 2,
+                        "endColumnIndex": 3,
+                    },
+                    "rule": {
+                        "condition": {
+                            "type": "ONE_OF_LIST",
+                            "values": [
+                                {"userEnteredValue": option}
+                                for option in GROUPING_FACILITATOR_ACTIVE_OPTIONS
+                            ],
+                        },
+                        "showCustomUi": True,
+                        "strict": True,
+                    },
+                }
+            },
+            {
+                "updateSheetProperties": {
+                    "properties": {
+                        "sheetId": groupings_sheet_id,
+                        "gridProperties": {"frozenRowCount": 2},
+                    },
+                    "fields": "gridProperties.frozenRowCount",
+                }
+            },
+        ])
+    if requests:
         sheets.spreadsheets().batchUpdate(
             spreadsheetId=spreadsheet_id,
             body={
-                "requests": [
-                    {
-                        "setDataValidation": {
-                            "range": {
-                                "sheetId": names_sheet_id,
-                                "startRowIndex": 1,
-                                "startColumnIndex": 3,
-                                "endColumnIndex": 4,
-                            },
-                            "rule": {
-                                "condition": {
-                                    "type": "ONE_OF_LIST",
-                                    "values": [
-                                        {"userEnteredValue": option}
-                                        for option in SIGNUP_STATUS_OPTIONS
-                                    ],
-                                },
-                                "showCustomUi": True,
-                                "strict": True,
-                            },
-                        }
-                    },
-                    {
-                        "setDataValidation": {
-                            "range": {
-                                "sheetId": names_sheet_id,
-                                "startRowIndex": 1,
-                                "startColumnIndex": 6,
-                                "endColumnIndex": 7,
-                            },
-                            "rule": {
-                                "condition": {
-                                    "type": "ONE_OF_LIST",
-                                    "values": [
-                                        {"userEnteredValue": option}
-                                        for option in PROFILE_OPTIONS
-                                    ],
-                                },
-                                "showCustomUi": True,
-                                "strict": True,
-                            },
-                        }
-                    },
-                ]
+                "requests": requests
             },
         ).execute()
 
@@ -492,6 +575,85 @@ def write_tally_status_summary(sheets, spreadsheet_id: str):
         range=f"Tally!D1:E{len(status_rows)}",
         valueInputOption="USER_ENTERED",
         body={"values": status_rows},
+    ).execute()
+
+
+def write_groupings_automated_sheet(sheets, spreadsheet_id: str):
+    row1 = [
+        "Click + to edit faci list",
+        "Sort by A to Z",
+        "Sort by Z to A",
+        "",
+        "This table automatically populates. Do not make edits to columns E to H; copy-paste to another sheet if you need to edit groupings.",
+        "",
+        "",
+        "",
+        "This table auto populates confirmed attendees. Do not make edits to columns I to L. Copy-paste to another sheet to edit.",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "Automatically populates based on Names sheet - do not edit",
+    ]
+    row2 = [
+        "",
+        "Facilitator profile",
+        "Activated as facil?",
+        "Facilitator name",
+        "Newcomer / Enhanced facilitation",
+        "Male",
+        "Female",
+        "Spillover",
+        "Newcomer / Enhanced facilitation",
+        "Male + spillover",
+        "Female + spillover",
+        "Spillover",
+        "",
+        "No. of confirmed attendees not grouped (should show 0 if all confirmed attendees have been grouped)",
+        "may show negative if faci has yet to confirm attendance",
+        "",
+        "",
+        "Conditional formatting helper",
+    ]
+
+    default_rows = [["", profile, active] for profile, active in GROUPING_FACILITATOR_DEFAULT_ROWS]
+    # N5:N7 helper labels to match the legacy sheet layout.
+    default_rows[2].extend([""] * 10 + ["Male"])
+    default_rows[3].extend([""] * 10 + ["Female"])
+    default_rows[4].extend([""] * 10 + ["Newcomer"])
+    for idx in range(len(default_rows)):
+        if idx not in (2, 3, 4):
+            default_rows[idx].extend([""] * 11)
+
+    core_formula_row = [[
+        '=IFERROR(FILTER(Names!B:B,Names!G:G="Facilitator",Names!D:D="Confirmed"),"")',
+        '=IFERROR(ARRAY_CONSTRAIN({FILTER(Names!B:B,Names!D:D="Confirmed",Names!G:G="Newcomer");FILTER(Names!B:B,Names!D:D="Confirmed",Names!G:G="Enhanced Facilitation")},COUNTIF(C:C,"Yes"),1),"")',
+        '=IFERROR(ARRAY_CONSTRAIN(FILTER(Names!B:B,Names!D:D="Confirmed",Names!G:G="",REGEXMATCH(TO_TEXT(Names!H:H),"(?i)^(m|male)$")),COUNTA(D3:D1502),1),"#REF!")',
+        '=IFERROR(ARRAY_CONSTRAIN(FILTER(Names!B:B,Names!D:D="Confirmed",Names!G:G="",REGEXMATCH(TO_TEXT(Names!H:H),"(?i)^(f|female)$")),COUNTA(D3:D1502),1),"#REF!")',
+        '=IFERROR(UNIQUE({E3:E1001;F3:F1001;G3:G1001;FILTER(Names!B:B,Names!D:D="Confirmed",Names!G:G<>"Facilitator")},,TRUE),"null")',
+        '=IFNA(E3:E1001,"")',
+        '=UNIQUE({F3:F1001;H3:H1001},,TRUE)',
+        '=UNIQUE({G3:G1001;H3:H1001;F3:F1001;J3:J1001},,TRUE)',
+        '=UNIQUE({G3:G1001;H3:H1001;F3:F1001;J3:J1001;K3:K1001},,TRUE)',
+        "",
+        '=Tally!E4-SUBTOTAL(103,D3:H1502)+COUNTIF(E:H,"null")+COUNTIF(C:C,"No")',
+    ]]
+
+    sheets.spreadsheets().values().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={
+            "valueInputOption": "USER_ENTERED",
+            "data": [
+                {"range": f"'{GROUPINGS_AUTOMATED_SHEET_TITLE}'!A1:R1", "values": [row1]},
+                {"range": f"'{GROUPINGS_AUTOMATED_SHEET_TITLE}'!A2:R2", "values": [row2]},
+                {"range": f"'{GROUPINGS_AUTOMATED_SHEET_TITLE}'!A3:N11", "values": default_rows},
+                {"range": f"'{GROUPINGS_AUTOMATED_SHEET_TITLE}'!D3:N3", "values": core_formula_row},
+            ],
+        },
     ).execute()
 
 
