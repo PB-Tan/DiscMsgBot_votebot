@@ -1192,7 +1192,7 @@ async def _send_native_poll_and_track(
     return poll_state
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Ready.\n"
         "Use /publishpoll to preview then send a native Telegram poll.\n"
@@ -1201,9 +1201,18 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use /pollstatus [poll_id ...] to check tracked/open/closed status.\n"
         "Use /stoppoll <poll_id> to close a native poll (no more voting/edits).\n"
         "Use /forgetpoll <poll_id> to remove stale tracking.\n"
-        "A new spreadsheet is created per poll message."
+        "A new spreadsheet is created per poll published."
     )
 
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Ready.\n"
+        "Use /publishpoll to preview then send a native Telegram poll.\n"
+        "Use /sample to get a copy-paste template for /publishpoll.\n"
+        "Use /pollstatus [poll_id ...] to check tracked/open/closed status.\n"
+        "Use /stoppoll <poll_id> to close a native poll (no more voting/edits).\n"
+        "A new spreadsheet is created per poll published."
+    )
 
 async def sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
@@ -1280,7 +1289,7 @@ async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if updated:
                 save_native_poll_states()
 
-    lines = [f"Tracked native poll sheets: {len(native_items)}"]
+    lines = [f"Tracked poll sheets: {len(native_items)}"]
     if DRIVE_FOLDER_ID:
         folder_url = DRIVE_FOLDER_ID
         if not re.match(r"^https?://", folder_url, flags=re.IGNORECASE):
@@ -1313,6 +1322,7 @@ async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"sheet={spreadsheet_title}")
         lines.append(f"total_votes={total_votes}")
         lines.append("breakdown: \n" + "\n".join(count_parts))
+        lines.append(f"Google Sheet URL:")
         if state.get("spreadsheet_url"):
             lines.append(str(state["spreadsheet_url"]))
 
