@@ -69,6 +69,20 @@ NAMES_HEADERS = [
     "Comments / Changes from VoteBot",
 ]
 
+SIGNUP_STATUS_OPTIONS = [
+    "Signed up",
+    "Invite sent",
+    "Confirmed",
+    "Pulled out",
+    "Waitlisted",
+]
+
+PROFILE_OPTIONS = [
+    "Newcomer",
+    "Enhanced Facilitation",
+    "Facilitator",
+]
+
 VOTES_HEADERS = [
     "date_utc8", "time_utc8", "user_id", "username", "full_name", "choice", "lunch", "action"
 ]
@@ -368,6 +382,64 @@ def create_new_spreadsheet(
             ],
         },
     ).execute()
+
+    # Add dropdown validation for Names!D:D (Sign up status), starting from row 2.
+    names_sheet_id = None
+    for sheet in ss.get("sheets", []):
+        props = sheet.get("properties", {})
+        if props.get("title") == "Names":
+            names_sheet_id = props.get("sheetId")
+            break
+    if names_sheet_id is not None:
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "setDataValidation": {
+                            "range": {
+                                "sheetId": names_sheet_id,
+                                "startRowIndex": 1,
+                                "startColumnIndex": 3,
+                                "endColumnIndex": 4,
+                            },
+                            "rule": {
+                                "condition": {
+                                    "type": "ONE_OF_LIST",
+                                    "values": [
+                                        {"userEnteredValue": option}
+                                        for option in SIGNUP_STATUS_OPTIONS
+                                    ],
+                                },
+                                "showCustomUi": True,
+                                "strict": True,
+                            },
+                        }
+                    },
+                    {
+                        "setDataValidation": {
+                            "range": {
+                                "sheetId": names_sheet_id,
+                                "startRowIndex": 1,
+                                "startColumnIndex": 6,
+                                "endColumnIndex": 7,
+                            },
+                            "rule": {
+                                "condition": {
+                                    "type": "ONE_OF_LIST",
+                                    "values": [
+                                        {"userEnteredValue": option}
+                                        for option in PROFILE_OPTIONS
+                                    ],
+                                },
+                                "showCustomUi": True,
+                                "strict": True,
+                            },
+                        }
+                    },
+                ]
+            },
+        ).execute()
 
     return spreadsheet_id, url, title
 
