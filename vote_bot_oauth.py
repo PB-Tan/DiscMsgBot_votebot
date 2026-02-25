@@ -2120,6 +2120,7 @@ def initialize_runtime_services():
 def build_telegram_application() -> Application:
     telegram_app = Application.builder().token(BOT_TOKEN).build()
     telegram_app.add_handler(CommandHandler("start", start))
+    telegram_app.add_handler(CommandHandler("startall", startall))
     telegram_app.add_handler(CommandHandler("sample", sample))
     telegram_app.add_handler(CommandHandler("activesheets", activesheets))
     telegram_app.add_handler(CommandHandler("pollstatus", pollstatus))
