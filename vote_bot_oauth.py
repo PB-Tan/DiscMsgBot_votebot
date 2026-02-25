@@ -1241,10 +1241,8 @@ async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ready.\n"
         "Use /publishpoll to preview then send a native Telegram poll.\n"
         "Use /sample to get a copy-paste template for /publishpoll.\n"
-        "Use /activesheets to list tracked native poll sheets.\n"
         "Use /pollstatus [poll_id ...] to check tracked/open/closed status.\n"
-        "Use /stoppoll <poll_id> to close a native poll (no more voting/edits).\n"
-        "Use /forgetpoll <poll_id> to remove stale tracking.\n"
+        "Use /stoppoll <poll_id> to close a native poll and stop tracking it.\n"
         "A new spreadsheet is created per poll published."
     )
 
@@ -1254,7 +1252,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Use /publishpoll to preview then send a native Telegram poll.\n"
         "Use /sample to get a copy-paste template for /publishpoll.\n"
         "Use /pollstatus to check tracked/open/closed status for all polls.\n"
-        "Use /stoppoll <poll_id> to close a poll (no more voting/edits).\n"
+        "Use /stoppoll <poll_id> to close a poll and stop tracking it.\n"
         "A new spreadsheet is created per poll published."
     )
 
@@ -1580,8 +1578,8 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not raw_arg:
         await msg.reply_text(
             "Usage: /stoppoll <poll_id>\n"
-            "Tip: use /activesheets to copy a poll_id.\n"
-            "This closes the Telegram poll so participants can no longer vote or edit their vote."
+            "Tip: use /pollstatus to list tracked poll_ids.\n"
+            "This closes the Telegram poll and removes local tracking."
         )
         return
 
@@ -1590,7 +1588,7 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         poll_id = poll_id.split("=", 1)[1].strip()
     poll_id = poll_id.strip(",.;")
     if not poll_id:
-        await msg.reply_text("Invalid poll_id. Use /activesheets to copy a valid one.")
+        await msg.reply_text("Invalid poll_id. Use /pollstatus to copy a valid one.")
         return
 
     matched_key = None
@@ -1607,9 +1605,7 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Tracked poll not found: {poll_id}")
         return
 
-    if matched_state.get("closed"):
-        await msg.reply_text(f"Poll already closed: {poll_id}")
-        return
+    was_closed = bool(matched_state.get("closed"))
 
     chat_id = matched_state.get("chat_id")
     message_id_raw = matched_state.get("message_id")
@@ -1624,16 +1620,16 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    try:
-        await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
-    except Exception as e:
-        await msg.reply_text(f"Failed to stop poll_id={poll_id}: {e}")
-        return
+    if not was_closed:
+        try:
+            await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+        except Exception as e:
+            await msg.reply_text(f"Failed to stop poll_id={poll_id}: {e}")
+            return
+        matched_state["closed"] = True
 
-    matched_state["closed"] = True
-    save_native_poll_states()
     spreadsheet_id = str(matched_state.get("spreadsheet_id", "") or "")
-    if spreadsheet_id:
+    if spreadsheet_id and not was_closed:
         loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(
@@ -1642,8 +1638,16 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception as e:
             print("Poll Info status update failed for stoppoll:", e)
+    POLL_STATES.pop(matched_key, None)
+    save_native_poll_states()
 
-    reply = [f"Closed poll_id={poll_id}.", "Participants can no longer vote or edit their vote."]
+    reply = []
+    if was_closed:
+        reply.append(f"Poll already closed: {poll_id}")
+    else:
+        reply.append(f"Closed poll_id={poll_id}.")
+        reply.append("Participants can no longer vote or edit their vote.")
+    reply.append("Tracking removed for this poll.")
     spreadsheet_url = str(matched_state.get("spreadsheet_url", "") or "")
     if spreadsheet_url:
         reply.append(spreadsheet_url)
@@ -2185,10 +2189,8 @@ def build_telegram_application() -> Application:
     telegram_app.add_handler(CommandHandler("start", start))
     telegram_app.add_handler(CommandHandler("startall", startall))
     telegram_app.add_handler(CommandHandler("sample", sample))
-    telegram_app.add_handler(CommandHandler("activesheets", activesheets))
     telegram_app.add_handler(CommandHandler("pollstatus", pollstatus))
     telegram_app.add_handler(CommandHandler("stoppoll", stoppoll))
-    telegram_app.add_handler(CommandHandler("forgetpoll", forgetpoll))
     telegram_app.add_handler(CommandHandler("publishpoll", publishpoll))
     telegram_app.add_handler(PollAnswerHandler(on_native_poll_answer))
     telegram_app.add_handler(CallbackQueryHandler(on_publishpoll_preview_action, pattern=r"^ppc\|"))
