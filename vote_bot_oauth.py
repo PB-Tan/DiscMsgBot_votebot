@@ -89,15 +89,15 @@ VOTES_HEADERS = [
 
 PUBLISHPOLL_SAMPLE_TEMPLATE = (
     "/publishpoll\n"
-    "title=DAYWA Discussions\n"
-    "date=23 Feb 2026\n"
-    "desc=Join us for an afternoon...\n"
-    "venue=Balestier Road\n"
+    "title=<Enter event title here>\n"
+    "date=<Enter event date here>\n"
+    "desc=<Write a short description of the event>\n"
+    "venue=<Enter event location here>\n"
     "lunch=12:30-2pm\n"
     "session=2-4pm\n"
     "option1=discussion session only\n"
     "option2=discussion session + lunch\n"
-    "cap=40\n\n"
+    "cap=50\n\n"
 )
 
 
