@@ -1554,10 +1554,10 @@ async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Ready.\n"
-        "Use /publishpoll to preview then send a native Telegram poll.\n"
-        "Use /sample to get a copy-paste template for /publishpoll.\n"
+        "Use /sample to get a copy-paste template for publishpoll.\n"
+        "Use /publishpoll to preview then send a Telegram poll.\n"
         "Use /pollstatus to check tracked/open/closed status for all polls.\n"
-        "Use /stoppoll <poll_id> to close a poll and stop tracking it.\n"
+        "Use /stoppoll to select and close a poll\n"
         "A new spreadsheet is created per poll published."
     )
 
