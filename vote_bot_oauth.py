@@ -949,6 +949,7 @@ def upsert_name_result(
 # --------------------
 POLL_STATES = {}  # ("native", poll_id) -> state
 PENDING_PUBLISH_PREVIEWS = {}  # token -> {raw_body, chat_id, user_id, created_ts}
+PENDING_STOPPOLL_CONFIRMATIONS = {}  # token -> {poll_id, chat_id, user_id, created_ts}
 MEMBER_INDEX = {"enabled": False, "source": "", "handles": set(), "names": {}}
 MEMBER_INDEX_LAST_REFRESH_TS = 0.0
 SHEETS = None
@@ -970,6 +971,20 @@ def _prune_pending_publish_previews() -> None:
         PENDING_PUBLISH_PREVIEWS.pop(token, None)
 
 
+def _prune_pending_stoppoll_confirmations() -> None:
+    now = time.time()
+    expired = []
+    for token, item in PENDING_STOPPOLL_CONFIRMATIONS.items():
+        try:
+            created_ts = float(item.get("created_ts", 0))
+        except (TypeError, ValueError, AttributeError):
+            created_ts = 0.0
+        if created_ts <= 0 or (now - created_ts) > PUBLISH_PREVIEW_TTL_SECONDS:
+            expired.append(token)
+    for token in expired:
+        PENDING_STOPPOLL_CONFIRMATIONS.pop(token, None)
+
+
 def _serialize_poll_state(state: dict) -> dict:
     choices = list(state.get("choices") or CHOICES)
     choice_count = max(2, len(choices))
@@ -981,6 +996,7 @@ def _serialize_poll_state(state: dict) -> dict:
         except (IndexError, TypeError, ValueError):
             counts.append(0)
     return {
+        "poll_title": str(state.get("poll_title", "")),
         "spreadsheet_id": str(state.get("spreadsheet_id", "")),
         "spreadsheet_url": str(state.get("spreadsheet_url", "")),
         "spreadsheet_title": str(state.get("spreadsheet_title", "")),
@@ -999,6 +1015,7 @@ def _serialize_poll_state(state: dict) -> dict:
 def _deserialize_poll_state(raw: dict) -> Optional[dict]:
     if not isinstance(raw, dict):
         return None
+    poll_title = str(raw.get("poll_title", "")).strip()
     spreadsheet_id = str(raw.get("spreadsheet_id", "")).strip()
     spreadsheet_url = str(raw.get("spreadsheet_url", "")).strip()
     spreadsheet_title = str(raw.get("spreadsheet_title", "")).strip()
@@ -1048,6 +1065,7 @@ def _deserialize_poll_state(raw: dict) -> Optional[dict]:
         cap = 0
 
     return {
+        "poll_title": poll_title,
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
         "spreadsheet_title": spreadsheet_title,
@@ -1124,6 +1142,7 @@ def create_poll_state(
     )
     print("Spreadsheet created:", spreadsheet_url, "for", poll_key)
     return {
+        "poll_title": str(poll_title or ""),
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
         "spreadsheet_title": spreadsheet_title,
@@ -1378,6 +1397,15 @@ def publishpoll_preview_keyboard(token: str) -> InlineKeyboardMarkup:
         [
             InlineKeyboardButton("Publish", callback_data=f"ppc|{token}|ok"),
             InlineKeyboardButton("Cancel", callback_data=f"ppc|{token}|cancel"),
+        ]
+    ])
+
+
+def stoppoll_confirmation_keyboard(token: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("Yes", callback_data=f"spc|{token}|ok"),
+            InlineKeyboardButton("No", callback_data=f"spc|{token}|cancel"),
         ]
     ])
 
@@ -1785,6 +1813,9 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("Active poll_ids:")
         for poll_id in open_ids:
             lines.append(f"- {poll_id}")
+            state = tracked_map.get(poll_id) or {}
+            poll_title = str(state.get("poll_title", "") or "").strip()
+            lines.append(f"  title={poll_title}")
 
     if not native_items:
         lines.append("")
@@ -1808,6 +1839,71 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chunk_len += line_len
     if chunk_lines:
         await msg.reply_text("\n".join(chunk_lines))
+
+
+async def _stop_tracked_poll_and_remove(
+    context: ContextTypes.DEFAULT_TYPE,
+    poll_id: str,
+) -> str:
+    matched_key = None
+    matched_state = None
+    for key, state in POLL_STATES.items():
+        if not (isinstance(key, tuple) and len(key) == 2 and key[0] == "native"):
+            continue
+        if str(key[1]) == poll_id:
+            matched_key = key
+            matched_state = state
+            break
+
+    if matched_key is None or not isinstance(matched_state, dict):
+        raise ValueError(f"Tracked poll not found: {poll_id}")
+
+    was_closed = bool(matched_state.get("closed"))
+
+    chat_id = matched_state.get("chat_id")
+    message_id_raw = matched_state.get("message_id")
+    try:
+        message_id = int(message_id_raw)
+    except (TypeError, ValueError):
+        message_id = None
+
+    if not chat_id or message_id is None:
+        raise ValueError(
+            f"Cannot stop poll_id={poll_id}: missing tracked Telegram message id/chat id."
+        )
+
+    if not was_closed:
+        try:
+            await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+        except Exception as e:
+            raise RuntimeError(f"Failed to stop poll_id={poll_id}: {e}") from e
+        matched_state["closed"] = True
+
+    spreadsheet_id = str(matched_state.get("spreadsheet_id", "") or "")
+    if spreadsheet_id and not was_closed:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: update_poll_info_fields(SHEETS, spreadsheet_id, status="closed"),
+            )
+        except Exception as e:
+            print("Poll Info status update failed for stoppoll:", e)
+
+    POLL_STATES.pop(matched_key, None)
+    save_native_poll_states()
+
+    reply = []
+    if was_closed:
+        reply.append(f"Poll already closed: {poll_id}")
+    else:
+        reply.append(f"Closed poll_id={poll_id}.")
+        reply.append("Participants can no longer vote or edit their vote.")
+    reply.append("Tracking removed for this poll.")
+    spreadsheet_url = str(matched_state.get("spreadsheet_url", "") or "")
+    if spreadsheet_url:
+        reply.append(spreadsheet_url)
+    return "\n".join(reply)
 
 
 async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1846,53 +1942,24 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Tracked poll not found: {poll_id}")
         return
 
-    was_closed = bool(matched_state.get("closed"))
+    _prune_pending_stoppoll_confirmations()
+    token = uuid.uuid4().hex
+    PENDING_STOPPOLL_CONFIRMATIONS[token] = {
+        "poll_id": poll_id,
+        "chat_id": str(msg.chat_id),
+        "user_id": str(msg.from_user.id) if msg.from_user else "",
+        "created_ts": time.time(),
+    }
 
-    chat_id = matched_state.get("chat_id")
-    message_id_raw = matched_state.get("message_id")
-    try:
-        message_id = int(message_id_raw)
-    except (TypeError, ValueError):
-        message_id = None
-
-    if not chat_id or message_id is None:
-        await msg.reply_text(
-            f"Cannot stop poll_id={poll_id}: missing tracked Telegram message id/chat id."
-        )
-        return
-
-    if not was_closed:
-        try:
-            await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
-        except Exception as e:
-            await msg.reply_text(f"Failed to stop poll_id={poll_id}: {e}")
-            return
-        matched_state["closed"] = True
-
-    spreadsheet_id = str(matched_state.get("spreadsheet_id", "") or "")
-    if spreadsheet_id and not was_closed:
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.run_in_executor(
-                None,
-                lambda: update_poll_info_fields(SHEETS, spreadsheet_id, status="closed"),
-            )
-        except Exception as e:
-            print("Poll Info status update failed for stoppoll:", e)
-    POLL_STATES.pop(matched_key, None)
-    save_native_poll_states()
-
-    reply = []
-    if was_closed:
-        reply.append(f"Poll already closed: {poll_id}")
-    else:
-        reply.append(f"Closed poll_id={poll_id}.")
-        reply.append("Participants can no longer vote or edit their vote.")
-    reply.append("Tracking removed for this poll.")
-    spreadsheet_url = str(matched_state.get("spreadsheet_url", "") or "")
-    if spreadsheet_url:
-        reply.append(spreadsheet_url)
-    await msg.reply_text("\n".join(reply))
+    poll_title = str(matched_state.get("poll_title", "") or "").strip()
+    lines = [
+        f"poll_id={poll_id}",
+        f"title={poll_title}",
+        "",
+        "Note that stopping poll is irreversible and users can no longer add or edit their votes.",
+        "Proceed?",
+    ]
+    await msg.reply_text("\n".join(lines), reply_markup=stoppoll_confirmation_keyboard(token))
 
 
 async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2001,6 +2068,75 @@ async def on_publishpoll_preview_action(update: Update, context: ContextTypes.DE
     except Exception as e:
         print("Publish from preview failed:", e)
         await query.message.reply_text(f"Publish failed: {e}")
+
+
+async def on_stoppoll_confirmation_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    parts = (query.data or "").split("|")
+    if len(parts) != 3 or parts[0] != "spc":
+        await query.answer()
+        return
+
+    _, token, action = parts
+    _prune_pending_stoppoll_confirmations()
+    pending = PENDING_STOPPOLL_CONFIRMATIONS.get(token)
+    if not pending:
+        await query.answer("Confirmation expired. Run /stoppoll again.", show_alert=True)
+        return
+
+    requester_id = str(pending.get("user_id", ""))
+    actor_id = str(query.from_user.id) if query.from_user else ""
+    if requester_id and actor_id and requester_id != actor_id:
+        await query.answer("Only the requester can confirm/cancel.", show_alert=True)
+        return
+
+    if action == "cancel":
+        PENDING_STOPPOLL_CONFIRMATIONS.pop(token, None)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.answer("Cancelled")
+        if query.message:
+            await query.message.reply_text("Cancelled. Poll was not stopped.")
+        return
+
+    if action != "ok":
+        await query.answer()
+        return
+
+    PENDING_STOPPOLL_CONFIRMATIONS.pop(token, None)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+
+    poll_id = str(pending.get("poll_id", "") or "").strip()
+    if not poll_id:
+        await query.answer("Missing poll_id. Run /stoppoll again.", show_alert=True)
+        return
+
+    await query.answer("Stopping...")
+    if not query.message:
+        return
+
+    try:
+        result_text = await _stop_tracked_poll_and_remove(context, poll_id)
+    except ValueError as e:
+        await query.message.reply_text(str(e))
+        return
+    except RuntimeError as e:
+        await query.message.reply_text(str(e))
+        return
+    except Exception as e:
+        print("stoppoll confirm action failed:", e)
+        await query.message.reply_text(f"Failed to stop poll_id={poll_id}: {e}")
+        return
+
+    await query.message.reply_text(result_text)
 
 
 async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2228,6 +2364,7 @@ def build_telegram_application() -> Application:
     telegram_app.add_handler(CommandHandler("publishpoll", publishpoll))
     telegram_app.add_handler(PollAnswerHandler(on_native_poll_answer))
     telegram_app.add_handler(CallbackQueryHandler(on_publishpoll_preview_action, pattern=r"^ppc\|"))
+    telegram_app.add_handler(CallbackQueryHandler(on_stoppoll_confirmation_action, pattern=r"^spc\|"))
     return telegram_app
 
 
