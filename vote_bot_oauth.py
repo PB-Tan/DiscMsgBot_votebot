@@ -950,6 +950,7 @@ def upsert_name_result(
 POLL_STATES = {}  # ("native", poll_id) -> state
 PENDING_PUBLISH_PREVIEWS = {}  # token -> {raw_body, chat_id, user_id, created_ts}
 PENDING_STOPPOLL_CONFIRMATIONS = {}  # token -> {poll_id, chat_id, user_id, created_ts}
+PENDING_STOPPOLL_PICKERS = {}  # token -> {poll_ids, chat_id, user_id, created_ts}
 MEMBER_INDEX = {"enabled": False, "source": "", "handles": set(), "names": {}}
 MEMBER_INDEX_LAST_REFRESH_TS = 0.0
 SHEETS = None
@@ -983,6 +984,20 @@ def _prune_pending_stoppoll_confirmations() -> None:
             expired.append(token)
     for token in expired:
         PENDING_STOPPOLL_CONFIRMATIONS.pop(token, None)
+
+
+def _prune_pending_stoppoll_pickers() -> None:
+    now = time.time()
+    expired = []
+    for token, item in PENDING_STOPPOLL_PICKERS.items():
+        try:
+            created_ts = float(item.get("created_ts", 0))
+        except (TypeError, ValueError, AttributeError):
+            created_ts = 0.0
+        if created_ts <= 0 or (now - created_ts) > PUBLISH_PREVIEW_TTL_SECONDS:
+            expired.append(token)
+    for token in expired:
+        PENDING_STOPPOLL_PICKERS.pop(token, None)
 
 
 def _serialize_poll_state(state: dict) -> dict:
@@ -1410,6 +1425,16 @@ def stoppoll_confirmation_keyboard(token: str) -> InlineKeyboardMarkup:
     ])
 
 
+def stoppoll_picker_keyboard(token: str, poll_items: list[tuple[str, dict]]) -> InlineKeyboardMarkup:
+    rows = []
+    for idx, (poll_id, state) in enumerate(poll_items):
+        poll_title = str((state or {}).get("poll_title", "") or "").strip() or f"poll_id={poll_id}"
+        label = poll_title if len(poll_title) <= 60 else poll_title[:59].rstrip() + "…"
+        rows.append([InlineKeyboardButton(label, callback_data=f"sps|{token}|{idx}")])
+    rows.append([InlineKeyboardButton("Cancel", callback_data=f"sps|{token}|cancel")])
+    return InlineKeyboardMarkup(rows)
+
+
 def _preview_plain_text(value: str, parse_mode: Optional[str]) -> str:
     text = (value or "").strip()
     if not text:
@@ -1499,13 +1524,16 @@ async def _send_native_poll_and_track(
     poll_state["message_id"] = str(poll_msg.message_id)
     POLL_STATES[poll_key] = poll_state
     save_native_poll_states()
-    confirmation_lines = [f"Tracking sheet (internal circulation): {poll_state['spreadsheet_url']}"]
+    confirmation_lines = [
+        f"poll_id: {native_poll.id}",
+        f"title={spreadsheet_title}",
+        f"Tracking sheet (internal circulation): {poll_state['spreadsheet_url']}",
+    ]
     if DRIVE_FOLDER_ID:
         folder_url = DRIVE_FOLDER_ID
         if not re.match(r"^https?://", folder_url, flags=re.IGNORECASE):
             folder_url = f"https://drive.google.com/drive/folders/{folder_url}"
         confirmation_lines.append(f"Drive folder: {folder_url}")
-    confirmation_lines.append(f"poll_id: {native_poll.id}")
     await context.bot.send_message(
         chat_id=chat_id,
         text="\n".join(confirmation_lines),
@@ -1906,6 +1934,37 @@ async def _stop_tracked_poll_and_remove(
     return "\n".join(reply)
 
 
+async def _send_stoppoll_confirmation_prompt(
+    reply_target,
+    poll_id: str,
+    poll_state: dict,
+    *,
+    chat_id,
+    user_id: str,
+) -> None:
+    _prune_pending_stoppoll_confirmations()
+    token = uuid.uuid4().hex
+    PENDING_STOPPOLL_CONFIRMATIONS[token] = {
+        "poll_id": poll_id,
+        "chat_id": str(chat_id),
+        "user_id": str(user_id or ""),
+        "created_ts": time.time(),
+    }
+
+    poll_title = str(poll_state.get("poll_title", "") or "").strip()
+    lines = [
+        f"poll_id={poll_id}",
+        f"title={poll_title}",
+        "",
+        "Note that stopping poll is irreversible and users can no longer add or edit their votes.",
+        "Proceed?",
+    ]
+    await reply_target.reply_text(
+        "\n".join(lines),
+        reply_markup=stoppoll_confirmation_keyboard(token),
+    )
+
+
 async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
@@ -1913,10 +1972,37 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     raw_arg = extract_command_body(msg.text or "", "stoppoll").strip()
     if not raw_arg:
+        native_items = []
+        for key, state in POLL_STATES.items():
+            if isinstance(key, tuple) and len(key) == 2 and key[0] == "native":
+                native_items.append((str(key[1]), state))
+
+        if not native_items:
+            await msg.reply_text("No tracked native polls found.")
+            return
+
+        def _sort_key(item):
+            poll_id, state = item
+            try:
+                message_id = int(state.get("message_id", 0))
+            except (TypeError, ValueError):
+                message_id = 0
+            return (message_id, poll_id)
+
+        native_items.sort(key=_sort_key, reverse=True)
+
+        _prune_pending_stoppoll_pickers()
+        token = uuid.uuid4().hex
+        PENDING_STOPPOLL_PICKERS[token] = {
+            "poll_ids": [poll_id for poll_id, _ in native_items],
+            "chat_id": str(msg.chat_id),
+            "user_id": str(msg.from_user.id) if msg.from_user else "",
+            "created_ts": time.time(),
+        }
+
         await msg.reply_text(
-            "Usage: /stoppoll <poll_id>\n"
-            "Tip: use /pollstatus to list tracked poll_ids.\n"
-            "This closes the Telegram poll and prevents voting"
+            "Select a poll to stop (you will be asked to confirm next):",
+            reply_markup=stoppoll_picker_keyboard(token, native_items),
         )
         return
 
@@ -1942,24 +2028,13 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Tracked poll not found: {poll_id}")
         return
 
-    _prune_pending_stoppoll_confirmations()
-    token = uuid.uuid4().hex
-    PENDING_STOPPOLL_CONFIRMATIONS[token] = {
-        "poll_id": poll_id,
-        "chat_id": str(msg.chat_id),
-        "user_id": str(msg.from_user.id) if msg.from_user else "",
-        "created_ts": time.time(),
-    }
-
-    poll_title = str(matched_state.get("poll_title", "") or "").strip()
-    lines = [
-        f"poll_id={poll_id}",
-        f"title={poll_title}",
-        "",
-        "Note that stopping poll is irreversible and users can no longer add or edit their votes.",
-        "Proceed?",
-    ]
-    await msg.reply_text("\n".join(lines), reply_markup=stoppoll_confirmation_keyboard(token))
+    await _send_stoppoll_confirmation_prompt(
+        msg,
+        poll_id,
+        matched_state,
+        chat_id=msg.chat_id,
+        user_id=str(msg.from_user.id) if msg.from_user else "",
+    )
 
 
 async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2137,6 +2212,83 @@ async def on_stoppoll_confirmation_action(update: Update, context: ContextTypes.
         return
 
     await query.message.reply_text(result_text)
+
+
+async def on_stoppoll_picker_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    parts = (query.data or "").split("|")
+    if len(parts) != 3 or parts[0] != "sps":
+        await query.answer()
+        return
+
+    _, token, action = parts
+    _prune_pending_stoppoll_pickers()
+    pending = PENDING_STOPPOLL_PICKERS.get(token)
+    if not pending:
+        await query.answer("Selection expired. Run /stoppoll again.", show_alert=True)
+        return
+
+    requester_id = str(pending.get("user_id", ""))
+    actor_id = str(query.from_user.id) if query.from_user else ""
+    if requester_id and actor_id and requester_id != actor_id:
+        await query.answer("Only the requester can select/cancel.", show_alert=True)
+        return
+
+    if action == "cancel":
+        PENDING_STOPPOLL_PICKERS.pop(token, None)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await query.answer("Cancelled")
+        if query.message:
+            await query.message.reply_text("Cancelled. Poll was not stopped.")
+        return
+
+    try:
+        idx = int(action)
+    except (TypeError, ValueError):
+        await query.answer()
+        return
+
+    poll_ids = pending.get("poll_ids") or []
+    if not isinstance(poll_ids, list) or idx < 0 or idx >= len(poll_ids):
+        await query.answer("Selection invalid. Run /stoppoll again.", show_alert=True)
+        return
+
+    poll_id = str(poll_ids[idx]).strip()
+    if not poll_id:
+        await query.answer("Selection invalid. Run /stoppoll again.", show_alert=True)
+        return
+
+    matched_state = None
+    for key, state in POLL_STATES.items():
+        if isinstance(key, tuple) and len(key) == 2 and key[0] == "native" and str(key[1]) == poll_id:
+            matched_state = state
+            break
+    if not isinstance(matched_state, dict):
+        await query.answer("Poll no longer tracked. Run /stoppoll again.", show_alert=True)
+        return
+
+    PENDING_STOPPOLL_PICKERS.pop(token, None)
+    try:
+        await query.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await query.answer("Selected")
+    if not query.message:
+        return
+
+    await _send_stoppoll_confirmation_prompt(
+        query.message,
+        poll_id,
+        matched_state,
+        chat_id=query.message.chat_id,
+        user_id=actor_id,
+    )
 
 
 async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2364,6 +2516,7 @@ def build_telegram_application() -> Application:
     telegram_app.add_handler(CommandHandler("publishpoll", publishpoll))
     telegram_app.add_handler(PollAnswerHandler(on_native_poll_answer))
     telegram_app.add_handler(CallbackQueryHandler(on_publishpoll_preview_action, pattern=r"^ppc\|"))
+    telegram_app.add_handler(CallbackQueryHandler(on_stoppoll_picker_action, pattern=r"^sps\|"))
     telegram_app.add_handler(CallbackQueryHandler(on_stoppoll_confirmation_action, pattern=r"^spc\|"))
     return telegram_app
 
