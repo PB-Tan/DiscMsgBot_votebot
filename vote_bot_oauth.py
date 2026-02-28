@@ -141,12 +141,17 @@ TRACKER_OVERVIEW_HEADERS = [
     "gSheet Url",
     "poll_status",
     "created_by",
+    "date_created",
+    "time_created",
+    "date_closed",
+    "time_closed",
+    "closed_by",
 ]
 
 PUBLISHPOLL_SAMPLE_TEMPLATE = (
     "/publishpoll\n"
     "title=<Enter event title here>\n"
-    "date=<Enter event date here>\n"
+    "date=22-Feb-2026\n"
     "desc=<Write a short description of the event>\n"
     "venue=<Enter event location here>\n"
     "lunch=12:30-2pm\n"
@@ -159,7 +164,7 @@ PUBLISHPOLL_SAMPLE_TEMPLATE = (
 PUBLISHPOLL_MINIMAL_TEMPLATE = (
     "/publishpoll\n"
     "title=<Enter event title here>\n"
-    "date=<Enter event date here>\n\n"
+    "date=22-Feb-2026\n\n"
 )
 
 PUBLISHPOLL_SAMPLE_GUIDE = (
@@ -170,6 +175,7 @@ PUBLISHPOLL_SAMPLE_GUIDE = (
     "4. Review the preview, then tap Publish.\n\n"
     "Some rules:\n"
     "- Use one key per line in key=value or key:value format.\n"
+    "- date is required and must be DD-MMM-YYYY (example: 22-Feb-2026).\n"
     "- option1 (discussion session) and option2 (discussion session + lunch) are used by default if not provided.\n"
     "- option3 and option4 are optional and only used when filled.\n"
     "- cap is optional; if cap > 0, poll auto-closes at max votes; if not provided, poll has to be manually closed\n"
@@ -265,8 +271,30 @@ def _normalize_share_role(role: str) -> str:
     return aliases.get(r, "")
 
 
+def _format_actor_label(handle: Optional[str], user_id: Optional[str]) -> str:
+    actor_handle = str(handle or "").strip()
+    if actor_handle:
+        return actor_handle
+    actor_user_id = str(user_id or "").strip()
+    if actor_user_id:
+        return f"user_id:{actor_user_id}"
+    return ""
+
+
 def _escape_drive_query_value(value: str) -> str:
     return str(value or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _sheet_col_letter(index_1_based: int) -> str:
+    n = max(1, int(index_1_based))
+    letters = []
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        letters.append(chr(ord("A") + rem))
+    return "".join(reversed(letters))
+
+
+TRACKER_OVERVIEW_END_COL = _sheet_col_letter(len(TRACKER_OVERVIEW_HEADERS))
 
 
 def _ensure_file_in_drive_folder(drive, file_id: str) -> None:
@@ -307,7 +335,7 @@ def _ensure_tracker_overview_layout(sheets, tracker_spreadsheet_id: str) -> None
 
     sheets.spreadsheets().values().update(
         spreadsheetId=tracker_spreadsheet_id,
-        range=f"{TRACKER_OVERVIEW_TAB}!A1:F1",
+        range=f"{TRACKER_OVERVIEW_TAB}!A1:{TRACKER_OVERVIEW_END_COL}1",
         valueInputOption="RAW",
         body={"values": [TRACKER_OVERVIEW_HEADERS]},
     ).execute()
@@ -398,6 +426,11 @@ def upsert_tracker_overview_row(
     gsheet_url: str,
     poll_status: str,
     created_by: str,
+    date_created: str = "",
+    time_created: str = "",
+    date_closed: str = "",
+    time_closed: str = "",
+    closed_by: str = "",
 ) -> None:
     normalized_poll_id = str(poll_id or "").strip()
     if not normalized_poll_id:
@@ -407,6 +440,14 @@ def upsert_tracker_overview_row(
     normalized_poll_date = str(poll_date or "").strip()
     if not normalized_poll_date:
         normalized_poll_date, _ = now_utc8_date_time()
+    normalized_date_created = str(date_created or "").strip()
+    normalized_time_created = str(time_created or "").strip()
+    if not normalized_date_created or not normalized_time_created:
+        default_date, default_time = now_utc8_date_time()
+        if not normalized_date_created:
+            normalized_date_created = default_date
+        if not normalized_time_created:
+            normalized_time_created = default_time
 
     row_values = [
         normalized_poll_id,
@@ -415,6 +456,11 @@ def upsert_tracker_overview_row(
         str(gsheet_url or "").strip(),
         normalized_status,
         str(created_by or "").strip(),
+        normalized_date_created,
+        normalized_time_created,
+        str(date_closed or "").strip(),
+        str(time_closed or "").strip(),
+        str(closed_by or "").strip(),
     ]
 
     tracker_spreadsheet_id, _ = get_or_create_tracker_overview_spreadsheet(sheets, drive)
@@ -422,7 +468,7 @@ def upsert_tracker_overview_row(
     if target_row is None:
         sheets.spreadsheets().values().append(
             spreadsheetId=tracker_spreadsheet_id,
-            range=f"{TRACKER_OVERVIEW_TAB}!A:F",
+            range=f"{TRACKER_OVERVIEW_TAB}!A:{TRACKER_OVERVIEW_END_COL}",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
             body={"values": [row_values]},
@@ -431,7 +477,7 @@ def upsert_tracker_overview_row(
 
     sheets.spreadsheets().values().update(
         spreadsheetId=tracker_spreadsheet_id,
-        range=f"{TRACKER_OVERVIEW_TAB}!A{target_row}:F{target_row}",
+        range=f"{TRACKER_OVERVIEW_TAB}!A{target_row}:{TRACKER_OVERVIEW_END_COL}{target_row}",
         valueInputOption="RAW",
         body={"values": [row_values]},
     ).execute()
@@ -443,6 +489,7 @@ def update_tracker_overview_poll_status(
     *,
     poll_id: str,
     poll_status: str,
+    closed_by: str = "",
 ) -> None:
     normalized_poll_id = str(poll_id or "").strip()
     if not normalized_poll_id:
@@ -454,21 +501,43 @@ def update_tracker_overview_poll_status(
 
     tracker_spreadsheet_id, _ = get_or_create_tracker_overview_spreadsheet(sheets, drive)
     target_row = _find_tracker_row_by_poll_id(sheets, tracker_spreadsheet_id, normalized_poll_id)
+    close_date, close_time = now_utc8_date_time()
     if target_row is None:
+        row_values = [""] * len(TRACKER_OVERVIEW_HEADERS)
+        row_values[0] = normalized_poll_id
+        row_values[4] = normalized_status
+        if normalized_status.lower() == "closed":
+            row_values[8] = close_date
+            row_values[9] = close_time
+            row_values[10] = str(closed_by or "").strip()
         sheets.spreadsheets().values().append(
             spreadsheetId=tracker_spreadsheet_id,
-            range=f"{TRACKER_OVERVIEW_TAB}!A:F",
+            range=f"{TRACKER_OVERVIEW_TAB}!A:{TRACKER_OVERVIEW_END_COL}",
             valueInputOption="RAW",
             insertDataOption="INSERT_ROWS",
-            body={"values": [[normalized_poll_id, "", "", "", normalized_status, ""]]},
+            body={"values": [row_values]},
         ).execute()
         return
 
+    row_resp = sheets.spreadsheets().values().get(
+        spreadsheetId=tracker_spreadsheet_id,
+        range=f"{TRACKER_OVERVIEW_TAB}!A{target_row}:{TRACKER_OVERVIEW_END_COL}{target_row}",
+    ).execute()
+    existing = (row_resp.get("values") or [[]])[0]
+    row_values = [str(v) for v in list(existing[:len(TRACKER_OVERVIEW_HEADERS)])]
+    while len(row_values) < len(TRACKER_OVERVIEW_HEADERS):
+        row_values.append("")
+    row_values[4] = normalized_status
+    if normalized_status.lower() == "closed":
+        row_values[8] = close_date
+        row_values[9] = close_time
+        row_values[10] = str(closed_by or "").strip()
+
     sheets.spreadsheets().values().update(
         spreadsheetId=tracker_spreadsheet_id,
-        range=f"{TRACKER_OVERVIEW_TAB}!E{target_row}:E{target_row}",
+        range=f"{TRACKER_OVERVIEW_TAB}!A{target_row}:{TRACKER_OVERVIEW_END_COL}{target_row}",
         valueInputOption="RAW",
-        body={"values": [[normalized_status]]},
+        body={"values": [row_values]},
     ).execute()
 
 
@@ -539,10 +608,89 @@ def extract_poll_metadata(raw_text: str) -> dict[str, str]:
     return out
 
 
+def normalize_poll_date_dd_mmm_yyyy(value: str) -> tuple[str, Optional[str]]:
+    raw = str(value or "").strip()
+    month_abbr_to_num = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    num_to_month_abbr = {
+        1: "Jan",
+        2: "Feb",
+        3: "Mar",
+        4: "Apr",
+        5: "May",
+        6: "Jun",
+        7: "Jul",
+        8: "Aug",
+        9: "Sep",
+        10: "Oct",
+        11: "Nov",
+        12: "Dec",
+    }
+    if not raw:
+        return "", "Missing required field: date (DD-MMM-YYYY)."
+
+    m = re.fullmatch(r"(\d{1,2})-([A-Za-z]{3})-(\d{4})", raw)
+    if not m:
+        return "", f"Invalid date format: {raw}. Use DD-MMM-YYYY (example: 22-Feb-2026)."
+    day = int(m.group(1))
+    month_text = m.group(2).lower()
+    year = int(m.group(3))
+    month_num = month_abbr_to_num.get(month_text)
+    if month_num is None:
+        return "", f"Invalid month in date: {raw}. Use DD-MMM-YYYY (example: 22-Feb-2026)."
+    try:
+        datetime(year, month_num, day)
+    except ValueError:
+        return "", f"Invalid calendar date: {raw}. Use a real date in DD-MMM-YYYY."
+    normalized = f"{day:02d}-{num_to_month_abbr[month_num]}-{year:04d}"
+    return normalized, None
+
+
+def _append_or_override_date_in_raw_body(raw_body: str, normalized_date: str) -> str:
+    text = (raw_body or "").strip()
+    if not normalized_date:
+        return text
+    if not text:
+        return f"date={normalized_date}"
+    # Append normalized date so metadata parsers (last one wins) keep canonical format.
+    return f"{text}\ndate={normalized_date}"
+
+
+def validate_publishpoll_required_fields(
+    raw_body: str,
+) -> tuple[Optional[dict[str, str]], str, str, Optional[str]]:
+    poll_metadata = extract_poll_metadata(raw_body)
+    poll_title = str((poll_metadata.get("title") or extract_poll_title(raw_body) or "")).strip()
+    if not poll_title:
+        return None, "", "", "Missing required field: title."
+
+    normalized_date, date_error = normalize_poll_date_dd_mmm_yyyy(poll_metadata.get("date", ""))
+    if date_error:
+        return None, "", "", date_error
+
+    poll_metadata["title"] = poll_title
+    poll_metadata["date"] = normalized_date
+    normalized_raw_body = _append_or_override_date_in_raw_body(raw_body, normalized_date)
+    return poll_metadata, poll_title, normalized_raw_body, None
+
+
 def build_poll_info_rows(
     *,
     file_title: str,
     created_utc: str,
+    gsheet_url: str,
     poll_title: Optional[str],
     poll_metadata: Optional[dict[str, str]],
     choices: list[tuple[str, str]],
@@ -550,6 +698,11 @@ def build_poll_info_rows(
     creator_user_id: Optional[str] = None,
     poll_id: Optional[str] = None,
     poll_status: str = "open",
+    date_created: str = "",
+    time_created: str = "",
+    date_closed: str = "",
+    time_closed: str = "",
+    closed_by: str = "",
 ) -> list[list[str]]:
     meta = dict(poll_metadata or {})
     if poll_title and not meta.get("title"):
@@ -559,15 +712,36 @@ def build_poll_info_rows(
             meta[f"option{i}"] = label
         if not meta.get(f"lunch{i}"):
             meta[f"lunch{i}"] = lunch
+    created_by = _format_actor_label(creator_handle, creator_user_id)
+    normalized_status = (poll_status or "open").strip() or "open"
+
+    normalized_date_created = str(date_created or "").strip()
+    normalized_time_created = str(time_created or "").strip()
+    if not normalized_date_created or not normalized_time_created:
+        fallback_date, fallback_time = now_utc8_date_time()
+        if not normalized_date_created:
+            normalized_date_created = fallback_date
+        if not normalized_time_created:
+            normalized_time_created = fallback_time
 
     rows = [
         ["Key", "Value"],
         ["file_title", file_title],
         ["created_utc", created_utc],
+        ["poll_id", str(poll_id or "")],
+        ["poll_title", meta.get("title", "")],
+        ["poll_date", meta.get("date", "")],
+        ["gSheet Url", str(gsheet_url or "").strip()],
+        ["poll_status", normalized_status],
+        ["status", normalized_status],
+        ["created_by", created_by],
+        ["date_created", normalized_date_created],
+        ["time_created", normalized_time_created],
+        ["date_closed", str(date_closed or "").strip()],
+        ["time_closed", str(time_closed or "").strip()],
+        ["closed_by", str(closed_by or "").strip()],
         ["creator_handle", creator_handle or ""],
         ["creator_user_id", creator_user_id or ""],
-        ["poll_id", str(poll_id or "")],
-        ["status", (poll_status or "open").strip() or "open"],
         ["title", meta.get("title", "")],
         ["desc", meta.get("desc", "")],
         ["date", meta.get("date", "")],
@@ -620,6 +794,7 @@ def create_new_spreadsheet(
     ss = sheets.spreadsheets().create(body=body).execute()
     spreadsheet_id = ss["spreadsheetId"]
     url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
+    date_created, time_created = now_utc8_date_time()
 
     # Move into folder if provided
     _ensure_file_in_drive_folder(drive, spreadsheet_id)
@@ -640,6 +815,7 @@ def create_new_spreadsheet(
     poll_info_rows = build_poll_info_rows(
         file_title=title,
         created_utc=ts,
+        gsheet_url=url,
         poll_title=poll_title,
         poll_metadata=poll_metadata,
         choices=list(choices),
@@ -647,6 +823,8 @@ def create_new_spreadsheet(
         creator_user_id=creator_user_id,
         poll_id=poll_id,
         poll_status=poll_status,
+        date_created=date_created,
+        time_created=time_created,
     )
     sheets.spreadsheets().values().batchUpdate(
         spreadsheetId=spreadsheet_id,
@@ -931,13 +1109,36 @@ def update_tally(sheets, spreadsheet_id: str, choices: list[tuple[str, str]], co
 POLL_INFO_KEY_ROWS = {
     "poll_id": 6,
     "status": 7,
+    "poll_status": 7,
+    "date_closed": 0,
+    "time_closed": 0,
+    "closed_by": 0,
 }
 
 
+def _load_poll_info_key_rows(sheets, spreadsheet_id: str) -> dict[str, int]:
+    key_rows: dict[str, int] = {}
+    try:
+        resp = sheets.spreadsheets().values().get(
+            spreadsheetId=spreadsheet_id,
+            range="Poll Info!A1:A300",
+        ).execute()
+    except Exception:
+        return key_rows
+
+    for idx, row in enumerate(resp.get("values", []), start=1):
+        key = str(row[0]).strip() if row else ""
+        if key:
+            key_rows[key] = idx
+    return key_rows
+
+
 def update_poll_info_fields(sheets, spreadsheet_id: str, **fields: str):
+    key_rows = _load_poll_info_key_rows(sheets, spreadsheet_id)
     data = []
     for key, value in fields.items():
-        row_num = POLL_INFO_KEY_ROWS.get(str(key))
+        key_text = str(key)
+        row_num = key_rows.get(key_text) or POLL_INFO_KEY_ROWS.get(key_text)
         if not row_num:
             continue
         data.append(
@@ -1412,11 +1613,8 @@ def create_poll_state(
     poll_date = ""
     if isinstance(poll_metadata, dict):
         poll_date = str(poll_metadata.get("date", "") or "").strip()
-    created_by = str(creator_handle or "").strip()
-    if not created_by:
-        creator_user_id_text = str(creator_user_id or "").strip()
-        if creator_user_id_text:
-            created_by = f"user_id:{creator_user_id_text}"
+    created_by = _format_actor_label(creator_handle, creator_user_id)
+    date_created, time_created = now_utc8_date_time()
     try:
         upsert_tracker_overview_row(
             SHEETS,
@@ -1427,6 +1625,8 @@ def create_poll_state(
             gsheet_url=spreadsheet_url,
             poll_status="open",
             created_by=created_by,
+            date_created=date_created,
+            time_created=time_created,
         )
     except Exception as e:
         print("Tracker overview upsert failed for create_poll_state:", e)
@@ -1762,6 +1962,10 @@ async def _send_native_poll_and_track(
 ):
     poll_question = _condense_poll_question(raw_body)
     poll_metadata = extract_poll_metadata(raw_body)
+    normalized_date, date_error = normalize_poll_date_dd_mmm_yyyy(poll_metadata.get("date", ""))
+    if date_error:
+        raise ValueError(date_error)
+    poll_metadata["date"] = normalized_date
     poll_choices = extract_native_poll_choices(raw_body)
     poll_cap = extract_poll_cap(raw_body)
     spreadsheet_title = (poll_metadata.get("title") or extract_poll_title(raw_body) or poll_question).strip()
@@ -2244,6 +2448,8 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _stop_tracked_poll_and_remove(
     context: ContextTypes.DEFAULT_TYPE,
     poll_id: str,
+    *,
+    closed_by: str = "",
 ) -> str:
     matched_key = None
     matched_state = None
@@ -2281,11 +2487,20 @@ async def _stop_tracked_poll_and_remove(
 
     spreadsheet_id = str(matched_state.get("spreadsheet_id", "") or "")
     if spreadsheet_id and not was_closed:
+        close_date, close_time = now_utc8_date_time()
         loop = asyncio.get_running_loop()
         try:
             await loop.run_in_executor(
                 None,
-                lambda: update_poll_info_fields(SHEETS, spreadsheet_id, status="closed"),
+                lambda: update_poll_info_fields(
+                    SHEETS,
+                    spreadsheet_id,
+                    status="closed",
+                    poll_status="closed",
+                    date_closed=close_date,
+                    time_closed=close_time,
+                    closed_by=closed_by,
+                ),
             )
         except Exception as e:
             print("Poll Info status update failed for stoppoll:", e)
@@ -2299,6 +2514,7 @@ async def _stop_tracked_poll_and_remove(
                     DRIVE,
                     poll_id=poll_id,
                     poll_status="closed",
+                    closed_by=closed_by,
                 ),
             )
         except Exception as e:
@@ -2431,16 +2647,25 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw_body = extract_command_body(msg.text or "", "publishpoll")
     if not raw_body.strip():
         await msg.reply_text(
-            "Usage: /publishpoll cannot have empty title and date.\n"
+            "Usage error: /publishpoll requires title and date.\n"
             "Refer to /sample for copy and paste-ready template.\n\n"
         )
         return
 
-    poll_prompt, parse_mode = build_poll_prompt(raw_body)
+    _, _, normalized_raw_body, validation_error = validate_publishpoll_required_fields(raw_body)
+    if validation_error:
+        await msg.reply_text(
+            "Usage error:\n"
+            f"{validation_error}\n"
+            "Refer to /sample for format rules."
+        )
+        return
+
+    poll_prompt, parse_mode = build_poll_prompt(normalized_raw_body)
     context_text = strip_prompt_line(poll_prompt, parse_mode)
-    poll_question = _condense_poll_question(raw_body)
-    poll_choices = extract_native_poll_choices(raw_body)
-    poll_cap = extract_poll_cap(raw_body)
+    poll_question = _condense_poll_question(normalized_raw_body)
+    poll_choices = extract_native_poll_choices(normalized_raw_body)
+    poll_cap = extract_poll_cap(normalized_raw_body)
     poll_options = [label for label, _ in poll_choices]
     context_preview = _preview_plain_text(context_text, parse_mode)
 
@@ -2460,7 +2685,7 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     _prune_pending_publish_previews()
     token = uuid.uuid4().hex
     PENDING_PUBLISH_PREVIEWS[token] = {
-        "raw_body": raw_body,
+        "raw_body": normalized_raw_body,
         "chat_id": str(msg.chat_id),
         "user_id": str(msg.from_user.id) if msg.from_user else "",
         "created_ts": time.time(),
@@ -2584,8 +2809,15 @@ async def on_stoppoll_confirmation_action(update: Update, context: ContextTypes.
     if not query.message:
         return
 
+    closer = ""
+    if query.from_user:
+        if getattr(query.from_user, "username", None):
+            closer = f"@{query.from_user.username}"
+        else:
+            closer = f"user_id:{query.from_user.id}"
+
     try:
-        result_text = await _stop_tracked_poll_and_remove(context, poll_id)
+        result_text = await _stop_tracked_poll_and_remove(context, poll_id, closed_by=closer)
     except ValueError as e:
         await query.message.reply_text(str(e))
         return
@@ -2818,10 +3050,19 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
                 save_native_poll_states()
                 spreadsheet_id = str(poll_state.get("spreadsheet_id", "") or "")
                 if spreadsheet_id:
+                    close_date, close_time = now_utc8_date_time()
                     try:
                         await loop.run_in_executor(
                             None,
-                            lambda: update_poll_info_fields(SHEETS, spreadsheet_id, status="closed"),
+                            lambda: update_poll_info_fields(
+                                SHEETS,
+                                spreadsheet_id,
+                                status="closed",
+                                poll_status="closed",
+                                date_closed=close_date,
+                                time_closed=close_time,
+                                closed_by="auto_cap",
+                            ),
                         )
                     except Exception as e:
                         print("Poll Info status update failed for auto-close:", e)
@@ -2833,6 +3074,7 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
                             DRIVE,
                             poll_id=str(answer.poll_id),
                             poll_status="closed",
+                            closed_by="auto_cap",
                         ),
                     )
                 except Exception as e:
