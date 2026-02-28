@@ -135,9 +135,10 @@ VOTES_HEADERS = [
 ]
 TRACKER_OVERVIEW_TAB = "Tracker"
 TRACKER_OVERVIEW_HEADERS = [
+    "S/N",
     "poll_id",
-    "poll_title",
-    "poll_date",
+    "event_title",
+    "event_date",
     "gSheet Url",
     "poll_status",
     "created_by",
@@ -146,6 +147,11 @@ TRACKER_OVERVIEW_HEADERS = [
     "date_closed",
     "time_closed",
     "closed_by",
+    "total_votes",
+    "option1_votes",
+    "option2_votes",
+    "option3_votes",
+    "option4_votes",
 ]
 
 PUBLISHPOLL_SAMPLE_TEMPLATE = (
@@ -295,6 +301,60 @@ def _sheet_col_letter(index_1_based: int) -> str:
 
 
 TRACKER_OVERVIEW_END_COL = _sheet_col_letter(len(TRACKER_OVERVIEW_HEADERS))
+TRACKER_OVERVIEW_COL_SN = TRACKER_OVERVIEW_HEADERS.index("S/N")
+TRACKER_OVERVIEW_COL_POLL_ID = TRACKER_OVERVIEW_HEADERS.index("poll_id")
+TRACKER_OVERVIEW_COL_POLL_TITLE = TRACKER_OVERVIEW_HEADERS.index("poll_title")
+TRACKER_OVERVIEW_COL_POLL_DATE = TRACKER_OVERVIEW_HEADERS.index("poll_date")
+TRACKER_OVERVIEW_COL_GSHEET_URL = TRACKER_OVERVIEW_HEADERS.index("gSheet Url")
+TRACKER_OVERVIEW_COL_POLL_STATUS = TRACKER_OVERVIEW_HEADERS.index("poll_status")
+TRACKER_OVERVIEW_COL_CREATED_BY = TRACKER_OVERVIEW_HEADERS.index("created_by")
+TRACKER_OVERVIEW_COL_DATE_CREATED = TRACKER_OVERVIEW_HEADERS.index("date_created")
+TRACKER_OVERVIEW_COL_TIME_CREATED = TRACKER_OVERVIEW_HEADERS.index("time_created")
+TRACKER_OVERVIEW_COL_DATE_CLOSED = TRACKER_OVERVIEW_HEADERS.index("date_closed")
+TRACKER_OVERVIEW_COL_TIME_CLOSED = TRACKER_OVERVIEW_HEADERS.index("time_closed")
+TRACKER_OVERVIEW_COL_CLOSED_BY = TRACKER_OVERVIEW_HEADERS.index("closed_by")
+TRACKER_OVERVIEW_COL_TOTAL_VOTES = TRACKER_OVERVIEW_HEADERS.index("total_votes")
+TRACKER_OVERVIEW_COL_OPTION1_VOTES = TRACKER_OVERVIEW_HEADERS.index("option1_votes")
+TRACKER_OVERVIEW_COL_OPTION2_VOTES = TRACKER_OVERVIEW_HEADERS.index("option2_votes")
+TRACKER_OVERVIEW_COL_OPTION3_VOTES = TRACKER_OVERVIEW_HEADERS.index("option3_votes")
+TRACKER_OVERVIEW_COL_OPTION4_VOTES = TRACKER_OVERVIEW_HEADERS.index("option4_votes")
+
+
+def _normalize_tracker_row_values(values: list[Any]) -> list[str]:
+    row_values = [str(v) for v in list(values[:len(TRACKER_OVERVIEW_HEADERS)])]
+    while len(row_values) < len(TRACKER_OVERVIEW_HEADERS):
+        row_values.append("")
+    return row_values
+
+
+def _normalize_tracker_option_counts(values: Optional[list[int]]) -> list[int]:
+    out: list[int] = []
+    raw = list(values or [])
+    for i in range(4):
+        try:
+            v = int(raw[i])
+        except (IndexError, TypeError, ValueError):
+            v = 0
+        out.append(max(0, v))
+    return out
+
+
+def _next_tracker_serial_number(sheets, tracker_spreadsheet_id: str) -> int:
+    resp = sheets.spreadsheets().values().get(
+        spreadsheetId=tracker_spreadsheet_id,
+        range=f"{TRACKER_OVERVIEW_TAB}!A2:A",
+    ).execute()
+    max_sn = 0
+    for row in resp.get("values", []):
+        if not row:
+            continue
+        try:
+            sn = int(str(row[0]).strip())
+        except (TypeError, ValueError):
+            continue
+        if sn > max_sn:
+            max_sn = sn
+    return max_sn + 1 if max_sn > 0 else 1
 
 
 def _ensure_file_in_drive_folder(drive, file_id: str) -> None:
@@ -406,7 +466,7 @@ def _find_tracker_row_by_poll_id(
 
     resp = sheets.spreadsheets().values().get(
         spreadsheetId=tracker_spreadsheet_id,
-        range=f"{TRACKER_OVERVIEW_TAB}!A2:A",
+        range=f"{TRACKER_OVERVIEW_TAB}!B2:B",
     ).execute()
     values = resp.get("values", [])
     for idx, row in enumerate(values, start=2):
@@ -431,6 +491,8 @@ def upsert_tracker_overview_row(
     date_closed: str = "",
     time_closed: str = "",
     closed_by: str = "",
+    total_votes: int = 0,
+    option_vote_counts: Optional[list[int]] = None,
 ) -> None:
     normalized_poll_id = str(poll_id or "").strip()
     if not normalized_poll_id:
@@ -448,24 +510,33 @@ def upsert_tracker_overview_row(
             normalized_date_created = default_date
         if not normalized_time_created:
             normalized_time_created = default_time
-
-    row_values = [
-        normalized_poll_id,
-        str(poll_title or "").strip(),
-        normalized_poll_date,
-        str(gsheet_url or "").strip(),
-        normalized_status,
-        str(created_by or "").strip(),
-        normalized_date_created,
-        normalized_time_created,
-        str(date_closed or "").strip(),
-        str(time_closed or "").strip(),
-        str(closed_by or "").strip(),
-    ]
+    try:
+        normalized_total_votes = max(0, int(total_votes))
+    except (TypeError, ValueError):
+        normalized_total_votes = 0
+    option_counts = _normalize_tracker_option_counts(option_vote_counts)
 
     tracker_spreadsheet_id, _ = get_or_create_tracker_overview_spreadsheet(sheets, drive)
     target_row = _find_tracker_row_by_poll_id(sheets, tracker_spreadsheet_id, normalized_poll_id)
     if target_row is None:
+        row_values = [""] * len(TRACKER_OVERVIEW_HEADERS)
+        row_values[TRACKER_OVERVIEW_COL_SN] = str(_next_tracker_serial_number(sheets, tracker_spreadsheet_id))
+        row_values[TRACKER_OVERVIEW_COL_POLL_ID] = normalized_poll_id
+        row_values[TRACKER_OVERVIEW_COL_POLL_TITLE] = str(poll_title or "").strip()
+        row_values[TRACKER_OVERVIEW_COL_POLL_DATE] = normalized_poll_date
+        row_values[TRACKER_OVERVIEW_COL_GSHEET_URL] = str(gsheet_url or "").strip()
+        row_values[TRACKER_OVERVIEW_COL_POLL_STATUS] = normalized_status
+        row_values[TRACKER_OVERVIEW_COL_CREATED_BY] = str(created_by or "").strip()
+        row_values[TRACKER_OVERVIEW_COL_DATE_CREATED] = normalized_date_created
+        row_values[TRACKER_OVERVIEW_COL_TIME_CREATED] = normalized_time_created
+        row_values[TRACKER_OVERVIEW_COL_DATE_CLOSED] = str(date_closed or "").strip()
+        row_values[TRACKER_OVERVIEW_COL_TIME_CLOSED] = str(time_closed or "").strip()
+        row_values[TRACKER_OVERVIEW_COL_CLOSED_BY] = str(closed_by or "").strip()
+        row_values[TRACKER_OVERVIEW_COL_TOTAL_VOTES] = str(normalized_total_votes)
+        row_values[TRACKER_OVERVIEW_COL_OPTION1_VOTES] = str(option_counts[0])
+        row_values[TRACKER_OVERVIEW_COL_OPTION2_VOTES] = str(option_counts[1])
+        row_values[TRACKER_OVERVIEW_COL_OPTION3_VOTES] = str(option_counts[2])
+        row_values[TRACKER_OVERVIEW_COL_OPTION4_VOTES] = str(option_counts[3])
         sheets.spreadsheets().values().append(
             spreadsheetId=tracker_spreadsheet_id,
             range=f"{TRACKER_OVERVIEW_TAB}!A:{TRACKER_OVERVIEW_END_COL}",
@@ -474,6 +545,31 @@ def upsert_tracker_overview_row(
             body={"values": [row_values]},
         ).execute()
         return
+
+    row_resp = sheets.spreadsheets().values().get(
+        spreadsheetId=tracker_spreadsheet_id,
+        range=f"{TRACKER_OVERVIEW_TAB}!A{target_row}:{TRACKER_OVERVIEW_END_COL}{target_row}",
+    ).execute()
+    existing = (row_resp.get("values") or [[]])[0]
+    row_values = _normalize_tracker_row_values(existing)
+    if not row_values[TRACKER_OVERVIEW_COL_SN].strip().isdigit():
+        row_values[TRACKER_OVERVIEW_COL_SN] = str(_next_tracker_serial_number(sheets, tracker_spreadsheet_id))
+    row_values[TRACKER_OVERVIEW_COL_POLL_ID] = normalized_poll_id
+    row_values[TRACKER_OVERVIEW_COL_POLL_TITLE] = str(poll_title or "").strip()
+    row_values[TRACKER_OVERVIEW_COL_POLL_DATE] = normalized_poll_date
+    row_values[TRACKER_OVERVIEW_COL_GSHEET_URL] = str(gsheet_url or "").strip()
+    row_values[TRACKER_OVERVIEW_COL_POLL_STATUS] = normalized_status
+    row_values[TRACKER_OVERVIEW_COL_CREATED_BY] = str(created_by or "").strip()
+    row_values[TRACKER_OVERVIEW_COL_DATE_CREATED] = normalized_date_created
+    row_values[TRACKER_OVERVIEW_COL_TIME_CREATED] = normalized_time_created
+    row_values[TRACKER_OVERVIEW_COL_DATE_CLOSED] = str(date_closed or "").strip()
+    row_values[TRACKER_OVERVIEW_COL_TIME_CLOSED] = str(time_closed or "").strip()
+    row_values[TRACKER_OVERVIEW_COL_CLOSED_BY] = str(closed_by or "").strip()
+    row_values[TRACKER_OVERVIEW_COL_TOTAL_VOTES] = str(normalized_total_votes)
+    row_values[TRACKER_OVERVIEW_COL_OPTION1_VOTES] = str(option_counts[0])
+    row_values[TRACKER_OVERVIEW_COL_OPTION2_VOTES] = str(option_counts[1])
+    row_values[TRACKER_OVERVIEW_COL_OPTION3_VOTES] = str(option_counts[2])
+    row_values[TRACKER_OVERVIEW_COL_OPTION4_VOTES] = str(option_counts[3])
 
     sheets.spreadsheets().values().update(
         spreadsheetId=tracker_spreadsheet_id,
@@ -504,12 +600,18 @@ def update_tracker_overview_poll_status(
     close_date, close_time = now_utc8_date_time()
     if target_row is None:
         row_values = [""] * len(TRACKER_OVERVIEW_HEADERS)
-        row_values[0] = normalized_poll_id
-        row_values[4] = normalized_status
+        row_values[TRACKER_OVERVIEW_COL_SN] = str(_next_tracker_serial_number(sheets, tracker_spreadsheet_id))
+        row_values[TRACKER_OVERVIEW_COL_POLL_ID] = normalized_poll_id
+        row_values[TRACKER_OVERVIEW_COL_POLL_STATUS] = normalized_status
+        row_values[TRACKER_OVERVIEW_COL_TOTAL_VOTES] = "0"
+        row_values[TRACKER_OVERVIEW_COL_OPTION1_VOTES] = "0"
+        row_values[TRACKER_OVERVIEW_COL_OPTION2_VOTES] = "0"
+        row_values[TRACKER_OVERVIEW_COL_OPTION3_VOTES] = "0"
+        row_values[TRACKER_OVERVIEW_COL_OPTION4_VOTES] = "0"
         if normalized_status.lower() == "closed":
-            row_values[8] = close_date
-            row_values[9] = close_time
-            row_values[10] = str(closed_by or "").strip()
+            row_values[TRACKER_OVERVIEW_COL_DATE_CLOSED] = close_date
+            row_values[TRACKER_OVERVIEW_COL_TIME_CLOSED] = close_time
+            row_values[TRACKER_OVERVIEW_COL_CLOSED_BY] = str(closed_by or "").strip()
         sheets.spreadsheets().values().append(
             spreadsheetId=tracker_spreadsheet_id,
             range=f"{TRACKER_OVERVIEW_TAB}!A:{TRACKER_OVERVIEW_END_COL}",
@@ -524,14 +626,57 @@ def update_tracker_overview_poll_status(
         range=f"{TRACKER_OVERVIEW_TAB}!A{target_row}:{TRACKER_OVERVIEW_END_COL}{target_row}",
     ).execute()
     existing = (row_resp.get("values") or [[]])[0]
-    row_values = [str(v) for v in list(existing[:len(TRACKER_OVERVIEW_HEADERS)])]
-    while len(row_values) < len(TRACKER_OVERVIEW_HEADERS):
-        row_values.append("")
-    row_values[4] = normalized_status
+    row_values = _normalize_tracker_row_values(existing)
+    if not row_values[TRACKER_OVERVIEW_COL_SN].strip().isdigit():
+        row_values[TRACKER_OVERVIEW_COL_SN] = str(_next_tracker_serial_number(sheets, tracker_spreadsheet_id))
+    row_values[TRACKER_OVERVIEW_COL_POLL_STATUS] = normalized_status
     if normalized_status.lower() == "closed":
-        row_values[8] = close_date
-        row_values[9] = close_time
-        row_values[10] = str(closed_by or "").strip()
+        row_values[TRACKER_OVERVIEW_COL_DATE_CLOSED] = close_date
+        row_values[TRACKER_OVERVIEW_COL_TIME_CLOSED] = close_time
+        row_values[TRACKER_OVERVIEW_COL_CLOSED_BY] = str(closed_by or "").strip()
+
+    sheets.spreadsheets().values().update(
+        spreadsheetId=tracker_spreadsheet_id,
+        range=f"{TRACKER_OVERVIEW_TAB}!A{target_row}:{TRACKER_OVERVIEW_END_COL}{target_row}",
+        valueInputOption="RAW",
+        body={"values": [row_values]},
+    ).execute()
+
+
+def update_tracker_overview_aggregates(
+    sheets,
+    drive,
+    *,
+    poll_id: str,
+    total_votes: int,
+    option_vote_counts: Optional[list[int]] = None,
+) -> None:
+    normalized_poll_id = str(poll_id or "").strip()
+    if not normalized_poll_id:
+        return
+
+    try:
+        normalized_total_votes = max(0, int(total_votes))
+    except (TypeError, ValueError):
+        normalized_total_votes = 0
+    option_counts = _normalize_tracker_option_counts(option_vote_counts)
+
+    tracker_spreadsheet_id, _ = get_or_create_tracker_overview_spreadsheet(sheets, drive)
+    target_row = _find_tracker_row_by_poll_id(sheets, tracker_spreadsheet_id, normalized_poll_id)
+    if target_row is None:
+        return
+
+    row_resp = sheets.spreadsheets().values().get(
+        spreadsheetId=tracker_spreadsheet_id,
+        range=f"{TRACKER_OVERVIEW_TAB}!A{target_row}:{TRACKER_OVERVIEW_END_COL}{target_row}",
+    ).execute()
+    existing = (row_resp.get("values") or [[]])[0]
+    row_values = _normalize_tracker_row_values(existing)
+    row_values[TRACKER_OVERVIEW_COL_TOTAL_VOTES] = str(normalized_total_votes)
+    row_values[TRACKER_OVERVIEW_COL_OPTION1_VOTES] = str(option_counts[0])
+    row_values[TRACKER_OVERVIEW_COL_OPTION2_VOTES] = str(option_counts[1])
+    row_values[TRACKER_OVERVIEW_COL_OPTION3_VOTES] = str(option_counts[2])
+    row_values[TRACKER_OVERVIEW_COL_OPTION4_VOTES] = str(option_counts[3])
 
     sheets.spreadsheets().values().update(
         spreadsheetId=tracker_spreadsheet_id,
@@ -1627,6 +1772,8 @@ def create_poll_state(
             created_by=created_by,
             date_created=date_created,
             time_created=time_created,
+            total_votes=0,
+            option_vote_counts=[0, 0, 0, 0],
         )
     except Exception as e:
         print("Tracker overview upsert failed for create_poll_state:", e)
@@ -3032,6 +3179,19 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
             poll_state.get("counts", [0, 0]),
         ),
     )
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: update_tracker_overview_aggregates(
+                SHEETS,
+                DRIVE,
+                poll_id=str(answer.poll_id),
+                total_votes=len(poll_state.get("votes", {})),
+                option_vote_counts=list(poll_state.get("counts", [])),
+            ),
+        )
+    except Exception as e:
+        print("Tracker overview aggregate update failed:", e)
     save_native_poll_states()
 
     cap = int(poll_state.get("cap", 0) or 0)
