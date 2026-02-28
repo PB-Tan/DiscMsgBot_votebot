@@ -137,8 +137,8 @@ TRACKER_OVERVIEW_TAB = "Tracker"
 TRACKER_OVERVIEW_HEADERS = [
     "S/N",
     "poll_id",
-    "event_title",
     "event_date",
+    "event_title",
     "gSheet Url",
     "poll_status",
     "created_by",
@@ -303,8 +303,8 @@ def _sheet_col_letter(index_1_based: int) -> str:
 TRACKER_OVERVIEW_END_COL = _sheet_col_letter(len(TRACKER_OVERVIEW_HEADERS))
 TRACKER_OVERVIEW_COL_SN = TRACKER_OVERVIEW_HEADERS.index("S/N")
 TRACKER_OVERVIEW_COL_POLL_ID = TRACKER_OVERVIEW_HEADERS.index("poll_id")
-TRACKER_OVERVIEW_COL_POLL_TITLE = TRACKER_OVERVIEW_HEADERS.index("poll_title")
-TRACKER_OVERVIEW_COL_POLL_DATE = TRACKER_OVERVIEW_HEADERS.index("poll_date")
+TRACKER_OVERVIEW_COL_EVENT_DATE = TRACKER_OVERVIEW_HEADERS.index("event_date")
+TRACKER_OVERVIEW_COL_EVENT_TITLE = TRACKER_OVERVIEW_HEADERS.index("event_title")
 TRACKER_OVERVIEW_COL_GSHEET_URL = TRACKER_OVERVIEW_HEADERS.index("gSheet Url")
 TRACKER_OVERVIEW_COL_POLL_STATUS = TRACKER_OVERVIEW_HEADERS.index("poll_status")
 TRACKER_OVERVIEW_COL_CREATED_BY = TRACKER_OVERVIEW_HEADERS.index("created_by")
@@ -522,8 +522,8 @@ def upsert_tracker_overview_row(
         row_values = [""] * len(TRACKER_OVERVIEW_HEADERS)
         row_values[TRACKER_OVERVIEW_COL_SN] = str(_next_tracker_serial_number(sheets, tracker_spreadsheet_id))
         row_values[TRACKER_OVERVIEW_COL_POLL_ID] = normalized_poll_id
-        row_values[TRACKER_OVERVIEW_COL_POLL_TITLE] = str(poll_title or "").strip()
-        row_values[TRACKER_OVERVIEW_COL_POLL_DATE] = normalized_poll_date
+        row_values[TRACKER_OVERVIEW_COL_EVENT_DATE] = normalized_poll_date
+        row_values[TRACKER_OVERVIEW_COL_EVENT_TITLE] = str(poll_title or "").strip()
         row_values[TRACKER_OVERVIEW_COL_GSHEET_URL] = str(gsheet_url or "").strip()
         row_values[TRACKER_OVERVIEW_COL_POLL_STATUS] = normalized_status
         row_values[TRACKER_OVERVIEW_COL_CREATED_BY] = str(created_by or "").strip()
@@ -555,8 +555,8 @@ def upsert_tracker_overview_row(
     if not row_values[TRACKER_OVERVIEW_COL_SN].strip().isdigit():
         row_values[TRACKER_OVERVIEW_COL_SN] = str(_next_tracker_serial_number(sheets, tracker_spreadsheet_id))
     row_values[TRACKER_OVERVIEW_COL_POLL_ID] = normalized_poll_id
-    row_values[TRACKER_OVERVIEW_COL_POLL_TITLE] = str(poll_title or "").strip()
-    row_values[TRACKER_OVERVIEW_COL_POLL_DATE] = normalized_poll_date
+    row_values[TRACKER_OVERVIEW_COL_EVENT_DATE] = normalized_poll_date
+    row_values[TRACKER_OVERVIEW_COL_EVENT_TITLE] = str(poll_title or "").strip()
     row_values[TRACKER_OVERVIEW_COL_GSHEET_URL] = str(gsheet_url or "").strip()
     row_values[TRACKER_OVERVIEW_COL_POLL_STATUS] = normalized_status
     row_values[TRACKER_OVERVIEW_COL_CREATED_BY] = str(created_by or "").strip()
