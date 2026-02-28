@@ -35,6 +35,7 @@ TOKEN_JSON = os.environ["OAUTH_TOKEN_JSON"].strip()  # file path or raw authoriz
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
 SHEET_LINK_SHARE_ROLE = os.environ.get("SHEET_LINK_SHARE_ROLE", "").strip().lower()  # "", reader, writer, commenter
 SHEET_LINK_ALLOW_DISCOVERY = os.environ.get("SHEET_LINK_ALLOW_DISCOVERY", "false").strip().lower() in {"1", "true", "yes"}
+TRACKER_OVERVIEW_TITLE = os.environ.get("TRACKER_OVERVIEW_TITLE", "VoteBot_TrackerOverview").strip() or "VoteBot_TrackerOverview"
 MEMBER_CHECK_CSV_PATH = os.environ.get("MEMBER_CHECK_CSV_PATH", "").strip()
 MEMBER_CHECK_SOURCE = os.environ.get("MEMBER_CHECK_SOURCE", "").strip()  # spreadsheet ID or full URL
 MEMBER_CHECK_TAB = os.environ.get("MEMBER_CHECK_TAB", "Member Check").strip() or "Member Check"
@@ -131,6 +132,15 @@ TALLY_STATUS_ORDER = [
 
 VOTES_HEADERS = [
     "date_utc8", "time_utc8", "user_id", "username", "full_name", "choice", "lunch", "action"
+]
+TRACKER_OVERVIEW_TAB = "Tracker"
+TRACKER_OVERVIEW_HEADERS = [
+    "poll_id",
+    "poll_title",
+    "poll_date",
+    "gSheet Url",
+    "poll_status",
+    "created_by",
 ]
 
 PUBLISHPOLL_SAMPLE_TEMPLATE = (
@@ -253,6 +263,213 @@ def _normalize_share_role(role: str) -> str:
         "writer": "writer",
     }
     return aliases.get(r, "")
+
+
+def _escape_drive_query_value(value: str) -> str:
+    return str(value or "").replace("\\", "\\\\").replace("'", "\\'")
+
+
+def _ensure_file_in_drive_folder(drive, file_id: str) -> None:
+    if not DRIVE_FOLDER_ID:
+        return
+    file_meta = drive.files().get(fileId=file_id, fields="parents").execute()
+    prev_parents = ",".join(file_meta.get("parents", []))
+    drive.files().update(
+        fileId=file_id,
+        addParents=DRIVE_FOLDER_ID,
+        removeParents=prev_parents,
+        fields="id,parents",
+    ).execute()
+
+
+def _ensure_tracker_overview_layout(sheets, tracker_spreadsheet_id: str) -> None:
+    meta = sheets.spreadsheets().get(
+        spreadsheetId=tracker_spreadsheet_id,
+        fields="sheets.properties(title)",
+    ).execute()
+    tab_titles = {
+        str(((sheet.get("properties") or {}).get("title") or "")).strip()
+        for sheet in meta.get("sheets", [])
+    }
+    if TRACKER_OVERVIEW_TAB not in tab_titles:
+        sheets.spreadsheets().batchUpdate(
+            spreadsheetId=tracker_spreadsheet_id,
+            body={
+                "requests": [
+                    {
+                        "addSheet": {
+                            "properties": {"title": TRACKER_OVERVIEW_TAB}
+                        }
+                    }
+                ]
+            },
+        ).execute()
+
+    sheets.spreadsheets().values().update(
+        spreadsheetId=tracker_spreadsheet_id,
+        range=f"{TRACKER_OVERVIEW_TAB}!A1:F1",
+        valueInputOption="RAW",
+        body={"values": [TRACKER_OVERVIEW_HEADERS]},
+    ).execute()
+
+
+def get_or_create_tracker_overview_spreadsheet(sheets, drive) -> tuple[str, str]:
+    global TRACKER_OVERVIEW_SPREADSHEET_ID
+
+    if TRACKER_OVERVIEW_SPREADSHEET_ID:
+        tracker_id = TRACKER_OVERVIEW_SPREADSHEET_ID
+        _ensure_tracker_overview_layout(sheets, tracker_id)
+        return tracker_id, f"https://docs.google.com/spreadsheets/d/{tracker_id}"
+
+    escaped_title = _escape_drive_query_value(TRACKER_OVERVIEW_TITLE)
+    query_parts = [
+        "mimeType='application/vnd.google-apps.spreadsheet'",
+        "trashed=false",
+        f"name='{escaped_title}'",
+    ]
+    if DRIVE_FOLDER_ID:
+        query_parts.append(f"'{_escape_drive_query_value(DRIVE_FOLDER_ID)}' in parents")
+    query = " and ".join(query_parts)
+
+    found = drive.files().list(
+        q=query,
+        fields="files(id,name,createdTime)",
+        pageSize=5,
+        orderBy="createdTime desc",
+    ).execute()
+    files = found.get("files", [])
+    if files:
+        tracker_id = str(files[0].get("id", "")).strip()
+    else:
+        ss = sheets.spreadsheets().create(
+            body={
+                "properties": {"title": TRACKER_OVERVIEW_TITLE},
+                "sheets": [{"properties": {"title": TRACKER_OVERVIEW_TAB}}],
+            }
+        ).execute()
+        tracker_id = ss["spreadsheetId"]
+        _ensure_file_in_drive_folder(drive, tracker_id)
+
+        share_role = _normalize_share_role(SHEET_LINK_SHARE_ROLE)
+        if share_role:
+            drive.permissions().create(
+                fileId=tracker_id,
+                body={
+                    "type": "anyone",
+                    "role": share_role,
+                    "allowFileDiscovery": SHEET_LINK_ALLOW_DISCOVERY,
+                },
+                fields="id,type,role",
+            ).execute()
+
+    TRACKER_OVERVIEW_SPREADSHEET_ID = tracker_id
+    _ensure_tracker_overview_layout(sheets, tracker_id)
+    return tracker_id, f"https://docs.google.com/spreadsheets/d/{tracker_id}"
+
+
+def _find_tracker_row_by_poll_id(
+    sheets,
+    tracker_spreadsheet_id: str,
+    poll_id: str,
+) -> Optional[int]:
+    wanted_poll_id = str(poll_id or "").strip()
+    if not wanted_poll_id:
+        return None
+
+    resp = sheets.spreadsheets().values().get(
+        spreadsheetId=tracker_spreadsheet_id,
+        range=f"{TRACKER_OVERVIEW_TAB}!A2:A",
+    ).execute()
+    values = resp.get("values", [])
+    for idx, row in enumerate(values, start=2):
+        existing_poll_id = str(row[0]).strip() if row else ""
+        if existing_poll_id == wanted_poll_id:
+            return idx
+    return None
+
+
+def upsert_tracker_overview_row(
+    sheets,
+    drive,
+    *,
+    poll_id: str,
+    poll_title: str,
+    poll_date: str,
+    gsheet_url: str,
+    poll_status: str,
+    created_by: str,
+) -> None:
+    normalized_poll_id = str(poll_id or "").strip()
+    if not normalized_poll_id:
+        return
+
+    normalized_status = str(poll_status or "open").strip() or "open"
+    normalized_poll_date = str(poll_date or "").strip()
+    if not normalized_poll_date:
+        normalized_poll_date, _ = now_utc8_date_time()
+
+    row_values = [
+        normalized_poll_id,
+        str(poll_title or "").strip(),
+        normalized_poll_date,
+        str(gsheet_url or "").strip(),
+        normalized_status,
+        str(created_by or "").strip(),
+    ]
+
+    tracker_spreadsheet_id, _ = get_or_create_tracker_overview_spreadsheet(sheets, drive)
+    target_row = _find_tracker_row_by_poll_id(sheets, tracker_spreadsheet_id, normalized_poll_id)
+    if target_row is None:
+        sheets.spreadsheets().values().append(
+            spreadsheetId=tracker_spreadsheet_id,
+            range=f"{TRACKER_OVERVIEW_TAB}!A:F",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [row_values]},
+        ).execute()
+        return
+
+    sheets.spreadsheets().values().update(
+        spreadsheetId=tracker_spreadsheet_id,
+        range=f"{TRACKER_OVERVIEW_TAB}!A{target_row}:F{target_row}",
+        valueInputOption="RAW",
+        body={"values": [row_values]},
+    ).execute()
+
+
+def update_tracker_overview_poll_status(
+    sheets,
+    drive,
+    *,
+    poll_id: str,
+    poll_status: str,
+) -> None:
+    normalized_poll_id = str(poll_id or "").strip()
+    if not normalized_poll_id:
+        return
+
+    normalized_status = str(poll_status or "").strip()
+    if not normalized_status:
+        return
+
+    tracker_spreadsheet_id, _ = get_or_create_tracker_overview_spreadsheet(sheets, drive)
+    target_row = _find_tracker_row_by_poll_id(sheets, tracker_spreadsheet_id, normalized_poll_id)
+    if target_row is None:
+        sheets.spreadsheets().values().append(
+            spreadsheetId=tracker_spreadsheet_id,
+            range=f"{TRACKER_OVERVIEW_TAB}!A:F",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": [[normalized_poll_id, "", "", "", normalized_status, ""]]},
+        ).execute()
+        return
+
+    sheets.spreadsheets().values().update(
+        spreadsheetId=tracker_spreadsheet_id,
+        range=f"{TRACKER_OVERVIEW_TAB}!E{target_row}:E{target_row}",
+        valueInputOption="RAW",
+        body={"values": [[normalized_status]]},
+    ).execute()
 
 
 def extract_poll_metadata(raw_text: str) -> dict[str, str]:
@@ -405,15 +622,7 @@ def create_new_spreadsheet(
     url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
 
     # Move into folder if provided
-    if DRIVE_FOLDER_ID:
-        file_meta = drive.files().get(fileId=spreadsheet_id, fields="parents").execute()
-        prev_parents = ",".join(file_meta.get("parents", []))
-        drive.files().update(
-            fileId=spreadsheet_id,
-            addParents=DRIVE_FOLDER_ID,
-            removeParents=prev_parents,
-            fields="id,parents",
-        ).execute()
+    _ensure_file_in_drive_folder(drive, spreadsheet_id)
 
     share_role = _normalize_share_role(SHEET_LINK_SHARE_ROLE)
     if share_role:
@@ -999,6 +1208,7 @@ MEMBER_INDEX = {"enabled": False, "source": "", "handles": set(), "names": {}}
 MEMBER_INDEX_LAST_REFRESH_TS = 0.0
 SHEETS = None
 DRIVE = None
+TRACKER_OVERVIEW_SPREADSHEET_ID = ""
 PUBLISH_PREVIEW_TTL_SECONDS = 15 * 60
 
 
@@ -1199,6 +1409,27 @@ def create_poll_state(
         poll_id=native_poll_id,
         poll_status="open",
     )
+    poll_date = ""
+    if isinstance(poll_metadata, dict):
+        poll_date = str(poll_metadata.get("date", "") or "").strip()
+    created_by = str(creator_handle or "").strip()
+    if not created_by:
+        creator_user_id_text = str(creator_user_id or "").strip()
+        if creator_user_id_text:
+            created_by = f"user_id:{creator_user_id_text}"
+    try:
+        upsert_tracker_overview_row(
+            SHEETS,
+            DRIVE,
+            poll_id=native_poll_id,
+            poll_title=str(poll_title or "").strip(),
+            poll_date=poll_date,
+            gsheet_url=spreadsheet_url,
+            poll_status="open",
+            created_by=created_by,
+        )
+    except Exception as e:
+        print("Tracker overview upsert failed for create_poll_state:", e)
     print("Spreadsheet created:", spreadsheet_url, "for", poll_key)
     return {
         "poll_title": str(poll_title or ""),
@@ -1645,6 +1876,7 @@ async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ready.\n"
         "Use /publishpoll to preview then send a native Telegram poll.\n"
         "Use /sample to get a copy-paste template for /publishpoll.\n"
+        "Use /tracker to open the tracker overview spreadsheet.\n"
         "Use /pollstatus [poll_id ...] to check tracked/open/closed status.\n"
         "Use /stoppoll <poll_id> to close a poll and stop tracking it.\n"
         "A new spreadsheet is created per poll published."
@@ -1655,6 +1887,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ready.\n"
         "Use /sample to get a copy-paste template for publishpoll.\n"
         "Use /publishpoll to preview then send a Telegram poll.\n"
+        "Use /tracker to open the tracker overview spreadsheet.\n"
         "Use /pollstatus to check tracked/open/closed status for all polls.\n"
         "Use /stoppoll to select and close a poll\n"
         "A new spreadsheet is created per poll published."
@@ -1665,6 +1898,34 @@ async def sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
     await msg.reply_text(PUBLISHPOLL_SAMPLE_GUIDE)
+
+
+async def tracker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg:
+        return
+
+    loop = asyncio.get_running_loop()
+    try:
+        tracker_url = await loop.run_in_executor(
+            None,
+            lambda: get_or_create_tracker_overview_spreadsheet(SHEETS, DRIVE)[1],
+        )
+    except Exception as e:
+        print("Tracker command failed:", e)
+        await msg.reply_text("Tracker overview unavailable right now. Please try again.")
+        return
+
+    lines = [
+        "Tracker overview:",
+        str(tracker_url or "").strip(),
+    ]
+    if DRIVE_FOLDER_ID:
+        folder_url = DRIVE_FOLDER_ID
+        if not re.match(r"^https?://", folder_url, flags=re.IGNORECASE):
+            folder_url = f"https://drive.google.com/drive/folders/{folder_url}"
+        lines.extend(["", f"Drive folder: {folder_url}"])
+    await msg.reply_text("\n".join(lines))
 
 
 async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1844,6 +2105,16 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
+    tracker_url = ""
+    loop = asyncio.get_running_loop()
+    try:
+        tracker_url = await loop.run_in_executor(
+            None,
+            lambda: get_or_create_tracker_overview_spreadsheet(SHEETS, DRIVE)[1],
+        )
+    except Exception as e:
+        print("Tracker URL lookup failed for pollstatus:", e)
+
     raw_arg = extract_command_body(msg.text or "", "pollstatus").strip()
 
     native_items = []
@@ -1876,7 +2147,12 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        lines = ["Poll status lookup:"]
+        lines = ["Tracker overview:"]
+        if tracker_url:
+            lines.append(str(tracker_url))
+        else:
+            lines.append("(unavailable)")
+        lines.extend(["", "Poll status lookup:"])
         for poll_id in poll_ids:
             state = tracked_map.get(poll_id)
             if not isinstance(state, dict):
@@ -1925,6 +2201,9 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     closed_ids.sort(key=_poll_sort_key, reverse=True)
 
     lines = [
+        "Tracker overview:",
+        tracker_url if tracker_url else "(unavailable)",
+        "",
         "Poll tracking status:",
         f"total active polls={len(open_ids)}",
     ]
@@ -2010,6 +2289,20 @@ async def _stop_tracked_poll_and_remove(
             )
         except Exception as e:
             print("Poll Info status update failed for stoppoll:", e)
+    if not was_closed:
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: update_tracker_overview_poll_status(
+                    SHEETS,
+                    DRIVE,
+                    poll_id=poll_id,
+                    poll_status="closed",
+                ),
+            )
+        except Exception as e:
+            print("Tracker overview status update failed for stoppoll:", e)
 
     POLL_STATES.pop(matched_key, None)
     save_native_poll_states()
@@ -2533,6 +2826,18 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
                     except Exception as e:
                         print("Poll Info status update failed for auto-close:", e)
                 try:
+                    await loop.run_in_executor(
+                        None,
+                        lambda: update_tracker_overview_poll_status(
+                            SHEETS,
+                            DRIVE,
+                            poll_id=str(answer.poll_id),
+                            poll_status="closed",
+                        ),
+                    )
+                except Exception as e:
+                    print("Tracker overview status update failed for auto-close:", e)
+                try:
                     await context.bot.send_message(
                         chat_id=chat_id,
                         text=f"Poll closed automatically (cap reached: {cap}).",
@@ -2610,6 +2915,7 @@ def build_telegram_application() -> Application:
     telegram_app.add_handler(CommandHandler("start", with_allowed_user_check(start)))
     telegram_app.add_handler(CommandHandler("startall", with_allowed_user_check(startall)))
     telegram_app.add_handler(CommandHandler("sample", with_allowed_user_check(sample)))
+    telegram_app.add_handler(CommandHandler("tracker", with_allowed_user_check(tracker)))
     telegram_app.add_handler(CommandHandler("pollstatus", with_allowed_user_check(pollstatus)))
     telegram_app.add_handler(CommandHandler("stoppoll", with_allowed_user_check(stoppoll)))
     telegram_app.add_handler(CommandHandler("publishpoll", with_allowed_user_check(publishpoll)))
