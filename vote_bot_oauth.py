@@ -35,7 +35,7 @@ TOKEN_JSON = os.environ["OAUTH_TOKEN_JSON"].strip()  # file path or raw authoriz
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID", "").strip()
 SHEET_LINK_SHARE_ROLE = os.environ.get("SHEET_LINK_SHARE_ROLE", "").strip().lower()  # "", reader, writer, commenter
 SHEET_LINK_ALLOW_DISCOVERY = os.environ.get("SHEET_LINK_ALLOW_DISCOVERY", "false").strip().lower() in {"1", "true", "yes"}
-TRACKER_OVERVIEW_TITLE = os.environ.get("TRACKER_OVERVIEW_TITLE", "VoteBot_TrackerOverview").strip() or "VoteBot_TrackerOverview"
+TRACKER_OVERVIEW_TITLE = os.environ.get("TRACKER_OVERVIEW_TITLE", "0.VoteBot_metadata").strip() or "0.VoteBot_metadata"
 MEMBER_CHECK_CSV_PATH = os.environ.get("MEMBER_CHECK_CSV_PATH", "").strip()
 MEMBER_CHECK_SOURCE = os.environ.get("MEMBER_CHECK_SOURCE", "").strip()  # spreadsheet ID or full URL
 MEMBER_CHECK_TAB = os.environ.get("MEMBER_CHECK_TAB", "Member Check").strip() or "Member Check"
@@ -2080,7 +2080,7 @@ async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ready.\n"
         "Use /publishpoll to preview then send a native Telegram poll.\n"
         "Use /sample to get a copy-paste template for /publishpoll.\n"
-        "Use /tracker to open the tracker overview spreadsheet.\n"
+        "Use /metadata to open the metadata spreadsheet.\n"
         "Use /pollstatus [poll_id ...] to check tracked/open/closed status.\n"
         "Use /stoppoll <poll_id> to close a poll and stop tracking it.\n"
         "A new spreadsheet is created per poll published."
@@ -2091,7 +2091,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Ready.\n"
         "Use /sample to get a copy-paste template for publishpoll.\n"
         "Use /publishpoll to preview then send a Telegram poll.\n"
-        "Use /tracker to open the tracker overview spreadsheet.\n"
+        "Use /metadata to open the metadata spreadsheet.\n"
         "Use /pollstatus to check tracked/open/closed status for all polls.\n"
         "Use /stoppoll to select and close a poll\n"
         "A new spreadsheet is created per poll published."
@@ -2104,7 +2104,7 @@ async def sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(PUBLISHPOLL_SAMPLE_GUIDE)
 
 
-async def tracker(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def metadata(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
@@ -2116,12 +2116,12 @@ async def tracker(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lambda: get_or_create_tracker_overview_spreadsheet(SHEETS, DRIVE)[1],
         )
     except Exception as e:
-        print("Tracker command failed:", e)
-        await msg.reply_text("Tracker overview unavailable right now. Please try again.")
+        print("Metadata command failed:", e)
+        await msg.reply_text("Metadata sheet unavailable right now. Please try again.")
         return
 
     lines = [
-        "Tracker overview:",
+        "Metadata sheet:",
         str(tracker_url or "").strip(),
     ]
     if DRIVE_FOLDER_ID:
@@ -2351,7 +2351,7 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        lines = ["Tracker overview:"]
+        lines = ["Metadata sheet:"]
         if tracker_url:
             lines.append(str(tracker_url))
         else:
@@ -2405,7 +2405,7 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     closed_ids.sort(key=_poll_sort_key, reverse=True)
 
     lines = [
-        "Tracker overview:",
+        "Metadata sheet:",
         tracker_url if tracker_url else "(unavailable)",
         "",
         "Poll tracking status:",
@@ -3157,7 +3157,7 @@ def build_telegram_application() -> Application:
     telegram_app.add_handler(CommandHandler("start", with_allowed_user_check(start)))
     telegram_app.add_handler(CommandHandler("startall", with_allowed_user_check(startall)))
     telegram_app.add_handler(CommandHandler("sample", with_allowed_user_check(sample)))
-    telegram_app.add_handler(CommandHandler("tracker", with_allowed_user_check(tracker)))
+    telegram_app.add_handler(CommandHandler("metadata", with_allowed_user_check(metadata)))
     telegram_app.add_handler(CommandHandler("pollstatus", with_allowed_user_check(pollstatus)))
     telegram_app.add_handler(CommandHandler("stoppoll", with_allowed_user_check(stoppoll)))
     telegram_app.add_handler(CommandHandler("publishpoll", with_allowed_user_check(publishpoll)))
