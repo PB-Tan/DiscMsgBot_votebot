@@ -9,7 +9,7 @@ import time
 import json
 from itertools import zip_longest
 from datetime import datetime, timezone, timedelta
-from typing import Optional
+from typing import Optional, Callable, Awaitable, Any
 from urllib.parse import urlparse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -45,6 +45,7 @@ MEMBER_RAW_EXISTING_GENDER_RANGE = os.environ.get("MEMBER_RAW_EXISTING_GENDER_RA
 MEMBER_RAW_NEWCOMER_HANDLE_RANGE = os.environ.get("MEMBER_RAW_NEWCOMER_HANDLE_RANGE", "DAYWA Newcomers List!F2:F").strip()
 MEMBER_RAW_NEWCOMER_GENDER_RANGE = os.environ.get("MEMBER_RAW_NEWCOMER_GENDER_RANGE", "DAYWA Newcomers List!G2:G").strip()
 NATIVE_POLL_STATE_FILE = os.environ.get("NATIVE_POLL_STATE_FILE", "native_poll_states.json").strip() or "native_poll_states.json"
+ALLOWED_TELEGRAM_USER_IDS_RAW = os.environ.get("ALLOWED_TELEGRAM_USER_IDS", "").strip()
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -55,6 +56,24 @@ CHOICES = [
     ("discussion session only", "No"),   # (label, Lunch)
     ("discussion session + lunch", "Yes"),
 ]
+
+
+def _parse_allowed_telegram_user_ids(raw: str) -> set[int]:
+    out: set[int] = set()
+    invalid: list[str] = []
+    for token in re.split(r"[\s,]+", (raw or "").strip()):
+        if not token:
+            continue
+        try:
+            out.add(int(token))
+        except ValueError:
+            invalid.append(token)
+    if invalid:
+        print("Ignoring invalid ALLOWED_TELEGRAM_USER_IDS values:", ", ".join(invalid))
+    return out
+
+
+ALLOWED_TELEGRAM_USER_IDS = _parse_allowed_telegram_user_ids(ALLOWED_TELEGRAM_USER_IDS_RAW)
 
 NAMES_HEADERS = [
     'TG Link',
@@ -125,6 +144,31 @@ PUBLISHPOLL_SAMPLE_TEMPLATE = (
     "option1=discussion session only\n"
     "option2=discussion session + lunch\n"
     "cap=50\n\n"
+)
+
+PUBLISHPOLL_MINIMAL_TEMPLATE = (
+    "/publishpoll\n"
+    "title=<Enter event title here>\n"
+    "date=<Enter event date here>\n\n"
+)
+
+PUBLISHPOLL_SAMPLE_GUIDE = (
+    "Get started with /publishpoll\n\n"
+    "1. Copy one of the templates below.\n"
+    "2. Fill at least title and date.\n"
+    "3. Copy-paste it as one Telegram message.\n"
+    "4. Review the preview, then tap Publish.\n\n"
+    "Some rules:\n"
+    "- Use one key per line in key=value or key:value format.\n"
+    "- option1 (discussion session) and option2 (discussion session + lunch) are used by default if not provided.\n"
+    "- option3 and option4 are optional and only used when filled.\n"
+    "- cap is optional; if cap > 0, poll auto-closes at max votes; if not provided, poll has to be manually closed\n"
+    "- lunch1..lunch4 are optional lunch flags per option.\n"
+    "- lunch1 (No) and lunch2 (Yes) are the default values if not provided.\n\n"
+    "Minimal template:\n"
+    f"{PUBLISHPOLL_MINIMAL_TEMPLATE}"
+    "Full template:\n"
+    f"{PUBLISHPOLL_SAMPLE_TEMPLATE}"
 )
 
 
@@ -1541,6 +1585,61 @@ async def _send_native_poll_and_track(
     return poll_state
 
 
+def _extract_update_user_id(update: Update) -> Optional[int]:
+    effective_user = getattr(update, "effective_user", None)
+    if effective_user and getattr(effective_user, "id", None) is not None:
+        return int(effective_user.id)
+
+    answer = getattr(update, "poll_answer", None)
+    answer_user = getattr(answer, "user", None) if answer else None
+    if answer_user and getattr(answer_user, "id", None) is not None:
+        return int(answer_user.id)
+    return None
+
+
+async def _ensure_allowed_user(update: Update) -> bool:
+    if not ALLOWED_TELEGRAM_USER_IDS:
+        return True
+
+    user_id = _extract_update_user_id(update)
+    if user_id is not None and user_id in ALLOWED_TELEGRAM_USER_IDS:
+        return True
+
+    query = getattr(update, "callback_query", None)
+    if query:
+        try:
+            await query.answer("You are not authorized to use this bot.", show_alert=True)
+        except Exception:
+            pass
+        return False
+
+    msg = getattr(update, "message", None)
+    if msg:
+        try:
+            await msg.reply_text("You are not authorized to use this bot.")
+        except Exception:
+            pass
+        return False
+
+    if user_id is None:
+        print("Blocked update without user id while allowlist is enabled.")
+    else:
+        print("Blocked update from unauthorized Telegram user id:", user_id)
+    return False
+
+
+def with_allowed_user_check(
+    handler: Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]
+) -> Callable[[Update, ContextTypes.DEFAULT_TYPE], Awaitable[Any]]:
+    async def wrapped(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not await _ensure_allowed_user(update):
+            return
+        return await handler(update, context)
+
+    wrapped.__name__ = f"{handler.__name__}_allowlist"
+    return wrapped
+
+
 async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Ready.\n"
@@ -1565,13 +1664,7 @@ async def sample(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not msg:
         return
-    await msg.reply_text(
-        "Minimally, title and date fields should be filled. \n"
-        "Supports option3 and option4, if values are provided. \n"
-        "If cap values are provided, poll will automatically close on reaching max cap\n"
-        "Copy-paste this below:\n\n"
-        f"{PUBLISHPOLL_SAMPLE_TEMPLATE}"
-    )
+    await msg.reply_text(PUBLISHPOLL_SAMPLE_GUIDE)
 
 
 async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2453,6 +2546,12 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
 def initialize_runtime_services():
     global SHEETS, DRIVE, MEMBER_INDEX, MEMBER_INDEX_LAST_REFRESH_TS
 
+    if ALLOWED_TELEGRAM_USER_IDS:
+        allowed = ", ".join(str(x) for x in sorted(ALLOWED_TELEGRAM_USER_IDS))
+        print("Telegram allowlist enabled for user IDs:", allowed)
+    else:
+        print("Telegram allowlist disabled (ALLOWED_TELEGRAM_USER_IDS is empty).")
+
     creds = load_or_login_creds()
     SHEETS = build("sheets", "v4", credentials=creds)
     DRIVE = build("drive", "v3", credentials=creds)
@@ -2508,16 +2607,22 @@ def initialize_runtime_services():
 
 def build_telegram_application() -> Application:
     telegram_app = Application.builder().token(BOT_TOKEN).build()
-    telegram_app.add_handler(CommandHandler("start", start))
-    telegram_app.add_handler(CommandHandler("startall", startall))
-    telegram_app.add_handler(CommandHandler("sample", sample))
-    telegram_app.add_handler(CommandHandler("pollstatus", pollstatus))
-    telegram_app.add_handler(CommandHandler("stoppoll", stoppoll))
-    telegram_app.add_handler(CommandHandler("publishpoll", publishpoll))
-    telegram_app.add_handler(PollAnswerHandler(on_native_poll_answer))
-    telegram_app.add_handler(CallbackQueryHandler(on_publishpoll_preview_action, pattern=r"^ppc\|"))
-    telegram_app.add_handler(CallbackQueryHandler(on_stoppoll_picker_action, pattern=r"^sps\|"))
-    telegram_app.add_handler(CallbackQueryHandler(on_stoppoll_confirmation_action, pattern=r"^spc\|"))
+    telegram_app.add_handler(CommandHandler("start", with_allowed_user_check(start)))
+    telegram_app.add_handler(CommandHandler("startall", with_allowed_user_check(startall)))
+    telegram_app.add_handler(CommandHandler("sample", with_allowed_user_check(sample)))
+    telegram_app.add_handler(CommandHandler("pollstatus", with_allowed_user_check(pollstatus)))
+    telegram_app.add_handler(CommandHandler("stoppoll", with_allowed_user_check(stoppoll)))
+    telegram_app.add_handler(CommandHandler("publishpoll", with_allowed_user_check(publishpoll)))
+    telegram_app.add_handler(PollAnswerHandler(with_allowed_user_check(on_native_poll_answer)))
+    telegram_app.add_handler(
+        CallbackQueryHandler(with_allowed_user_check(on_publishpoll_preview_action), pattern=r"^ppc\|")
+    )
+    telegram_app.add_handler(
+        CallbackQueryHandler(with_allowed_user_check(on_stoppoll_picker_action), pattern=r"^sps\|")
+    )
+    telegram_app.add_handler(
+        CallbackQueryHandler(with_allowed_user_check(on_stoppoll_confirmation_action), pattern=r"^spc\|")
+    )
     return telegram_app
 
 

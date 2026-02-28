@@ -98,6 +98,7 @@ BOT_TOKEN=<telegram bot token>
 TELEGRAM_WEBHOOK_URL=https://<your-render-service>.onrender.com/webhook
 OAUTH_CLIENT_JSON=<raw oauth client json OR file path>
 OAUTH_TOKEN_JSON=<raw oauth token json OR file path>
+ALLOWED_TELEGRAM_USER_IDS=<optional comma/space-separated telegram user ids>
 ```
 
 Notes:
@@ -168,6 +169,7 @@ Useful optional settings:
 - `DRIVE_FOLDER_ID` - parent folder for created sheets
 - `SHEET_LINK_SHARE_ROLE` - `reader`, `commenter`, or `writer`
 - `SHEET_LINK_ALLOW_DISCOVERY` - `true`/`false`
+- `ALLOWED_TELEGRAM_USER_IDS` - restrict bot usage to specific Telegram user IDs (comma/space-separated), e.g. `12345678,23456789`
 - `MEMBER_CHECK_CSV_PATH` - local CSV for member lookup
 - `MEMBER_CHECK_SOURCE` / `MEMBER_CHECK_TAB` - live member lookup sheet
 - `MEMBER_RAW_SOURCE` - raw member data sheet source
