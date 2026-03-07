@@ -57,6 +57,7 @@ CHOICES = [
     ("discussion session only", "No"),   # (label, Lunch)
     ("discussion session + lunch", "Yes"),
 ]
+UTC8 = timezone(timedelta(hours=8))
 
 
 def _parse_allowed_telegram_user_ids(raw: str) -> set[int]:
@@ -158,6 +159,7 @@ PUBLISHPOLL_SAMPLE_TEMPLATE = (
     "/publishpoll\n"
     "title=<Enter event title here>\n"
     "date=22-Feb-2026\n"
+    "close_at=22-Feb-2026 18:00\n"
     "desc=<Write a short description of the event>\n"
     "venue=<Enter event location here>\n"
     "lunch=12:30-2pm\n"
@@ -173,6 +175,18 @@ PUBLISHPOLL_MINIMAL_TEMPLATE = (
     "date=22-Feb-2026\n\n"
 )
 
+PUBLISHPOLL_SITS_TEMPLATE = (
+    "/publishpoll\n"
+    "title=DAYWA guided meditation session\n"
+    "Description = Join us for online 30 mins guided meditation! Indicate your availability by (closing date), or when slots are filled!\n"
+    "date=22-Feb-2026\n"
+    "close_at=23-Feb-2026 18:00\n"
+    "Option1 = Yes, joining!\n"
+    "Option2 = Yes and I'm new to DAYWA!\n"
+    "Option3 = Joining from RISE, Penang!\n"
+    "cap = 30\n\n"
+)
+
 PUBLISHPOLL_SAMPLE_GUIDE = (
     "Get started with /publishpoll\n\n"
     "1. Copy one of the templates below.\n"
@@ -182,6 +196,7 @@ PUBLISHPOLL_SAMPLE_GUIDE = (
     "Some rules:\n"
     "- Use one key per line in key=value or key:value format.\n"
     "- date is required and must be DD-MMM-YYYY (example: 22-Feb-2026).\n"
+    "- close_at is optional and must be DD-MMM-YYYY HH:MM in UTC+8 (example: 22-Feb-2026 18:00).\n"
     "- option1 (discussion session) and option2 (discussion session + lunch) are used by default if not provided.\n"
     "- option3 and option4 are optional and only used when filled.\n"
     "- cap is optional; if cap > 0, poll auto-closes at max votes; if not provided, poll has to be manually closed\n"
@@ -189,6 +204,8 @@ PUBLISHPOLL_SAMPLE_GUIDE = (
     "- lunch1 (No) and lunch2 (Yes) are the default values if not provided.\n\n"
     "Minimal template:\n"
     f"{PUBLISHPOLL_MINIMAL_TEMPLATE}"
+    "Sits template:\n"
+    f"{PUBLISHPOLL_SITS_TEMPLATE}"
     "Full template:\n"
     f"{PUBLISHPOLL_SAMPLE_TEMPLATE}"
 )
@@ -707,6 +724,20 @@ def extract_poll_metadata(raw_text: str) -> dict[str, str]:
         "max": "cap",
         "max cap": "cap",
         "capacity": "cap",
+        "close_at": "close_at",
+        "closeat": "close_at",
+        "close at": "close_at",
+        "close": "close_at",
+        "closing": "close_at",
+        "closing at": "close_at",
+        "end": "close_at",
+        "ends": "close_at",
+        "closing_datetime": "close_at",
+        "closing_date_time": "close_at",
+        "closing_date_and_time": "close_at",
+        "closing datetime": "close_at",
+        "closing date time": "close_at",
+        "closing date and time": "close_at",
         "option1": "option1",
         "option 1": "option1",
         "choice1": "option1",
@@ -803,6 +834,74 @@ def normalize_poll_date_dd_mmm_yyyy(value: str) -> tuple[str, Optional[str]]:
     return normalized, None
 
 
+def normalize_poll_close_at_dd_mmm_yyyy_hh_mm(value: str) -> tuple[str, float, Optional[str]]:
+    raw = str(value or "").strip()
+    if not raw:
+        return "", 0.0, None
+
+    month_abbr_to_num = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    num_to_month_abbr = {
+        1: "Jan",
+        2: "Feb",
+        3: "Mar",
+        4: "Apr",
+        5: "May",
+        6: "Jun",
+        7: "Jul",
+        8: "Aug",
+        9: "Sep",
+        10: "Oct",
+        11: "Nov",
+        12: "Dec",
+    }
+    m = re.fullmatch(
+        r"(\d{1,2})-([A-Za-z]{3})-(\d{4})[ T]+(\d{1,2}):(\d{2})(?::(\d{2}))?",
+        raw,
+    )
+    if not m:
+        return "", 0.0, (
+            f"Invalid close_at format: {raw}. "
+            "Use DD-MMM-YYYY HH:MM in UTC+8 (example: 22-Feb-2026 18:00)."
+        )
+    day = int(m.group(1))
+    month_text = m.group(2).lower()
+    year = int(m.group(3))
+    hour = int(m.group(4))
+    minute = int(m.group(5))
+    second = int(m.group(6) or "0")
+    month_num = month_abbr_to_num.get(month_text)
+    if month_num is None:
+        return "", 0.0, (
+            f"Invalid month in close_at: {raw}. "
+            "Use DD-MMM-YYYY HH:MM in UTC+8."
+        )
+    try:
+        close_dt = datetime(year, month_num, day, hour, minute, second, tzinfo=UTC8)
+    except ValueError:
+        return "", 0.0, (
+            f"Invalid calendar datetime: {raw}. "
+            "Use a real datetime in DD-MMM-YYYY HH:MM (UTC+8)."
+        )
+    normalized = (
+        f"{day:02d}-{num_to_month_abbr[month_num]}-{year:04d} "
+        f"{hour:02d}:{minute:02d}"
+    )
+    return normalized, float(close_dt.timestamp()), None
+
+
 def _append_or_override_date_in_raw_body(raw_body: str, normalized_date: str) -> str:
     text = (raw_body or "").strip()
     if not normalized_date:
@@ -811,6 +910,15 @@ def _append_or_override_date_in_raw_body(raw_body: str, normalized_date: str) ->
         return f"date={normalized_date}"
     # Append normalized date so metadata parsers (last one wins) keep canonical format.
     return f"{text}\ndate={normalized_date}"
+
+
+def _append_or_override_close_at_in_raw_body(raw_body: str, normalized_close_at: str) -> str:
+    text = (raw_body or "").strip()
+    if not normalized_close_at:
+        return text
+    if not text:
+        return f"close_at={normalized_close_at}"
+    return f"{text}\nclose_at={normalized_close_at}"
 
 
 def validate_publishpoll_required_fields(
@@ -828,6 +936,16 @@ def validate_publishpoll_required_fields(
     poll_metadata["title"] = poll_title
     poll_metadata["date"] = normalized_date
     normalized_raw_body = _append_or_override_date_in_raw_body(raw_body, normalized_date)
+    normalized_close_at, _, close_at_error = normalize_poll_close_at_dd_mmm_yyyy_hh_mm(
+        poll_metadata.get("close_at", "")
+    )
+    if close_at_error:
+        return None, "", "", close_at_error
+    if normalized_close_at:
+        poll_metadata["close_at"] = normalized_close_at
+        normalized_raw_body = _append_or_override_close_at_in_raw_body(
+            normalized_raw_body, normalized_close_at
+        )
     return poll_metadata, poll_title, normalized_raw_body, None
 
 
@@ -894,6 +1012,7 @@ def build_poll_info_rows(
         ["lunch", meta.get("lunch", "")],
         ["session", meta.get("session", "")],
         ["cap", meta.get("cap", "")],
+        ["close_at", meta.get("close_at", "")],
         ["option1", meta.get("option1", "")],
         ["option2", meta.get("option2", "")],
         ["option3", meta.get("option3", "")],
@@ -1123,8 +1242,7 @@ def append_row(sheets, spreadsheet_id: str, range_a1: str, row: list):
 
 
 def now_utc8_date_time() -> tuple[str, str]:
-    utc8 = timezone(timedelta(hours=8))
-    now = datetime.now(utc8)
+    now = datetime.now(UTC8)
     return now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S")
 
 
@@ -1550,6 +1668,7 @@ POLL_STATES = {}  # ("native", poll_id) -> state
 PENDING_PUBLISH_PREVIEWS = {}  # token -> {raw_body, chat_id, user_id, created_ts}
 PENDING_STOPPOLL_CONFIRMATIONS = {}  # token -> {poll_id, chat_id, user_id, created_ts}
 PENDING_STOPPOLL_PICKERS = {}  # token -> {poll_ids, chat_id, user_id, created_ts}
+SCHEDULED_POLL_CLOSE_TASKS: dict[str, asyncio.Task[Any]] = {}
 MEMBER_INDEX = {"enabled": False, "source": "", "handles": set(), "names": {}}
 MEMBER_INDEX_LAST_REFRESH_TS = 0.0
 SHEETS = None
@@ -1600,6 +1719,100 @@ def _prune_pending_stoppoll_pickers() -> None:
         PENDING_STOPPOLL_PICKERS.pop(token, None)
 
 
+def _cancel_scheduled_poll_close(poll_id: str) -> None:
+    token = str(poll_id or "").strip()
+    if not token:
+        return
+    task = SCHEDULED_POLL_CLOSE_TASKS.pop(token, None)
+    if task and not task.done():
+        task.cancel()
+
+
+def _schedule_poll_close_task(
+    telegram_app: Application,
+    poll_id: str,
+    *,
+    close_at_ts: float,
+) -> None:
+    token = str(poll_id or "").strip()
+    if not token:
+        return
+    try:
+        target_ts = float(close_at_ts)
+    except (TypeError, ValueError):
+        target_ts = 0.0
+    if target_ts <= 0:
+        _cancel_scheduled_poll_close(token)
+        return
+
+    _cancel_scheduled_poll_close(token)
+
+    async def _runner() -> None:
+        try:
+            delay = max(0.0, target_ts - time.time())
+            if delay > 0:
+                await asyncio.sleep(delay)
+
+            poll_state = POLL_STATES.get(("native", token))
+            if not isinstance(poll_state, dict) or poll_state.get("closed"):
+                return
+
+            try:
+                expected_ts = float(poll_state.get("close_at_ts", 0) or 0)
+            except (TypeError, ValueError):
+                expected_ts = 0.0
+            if expected_ts <= 0 or abs(expected_ts - target_ts) > 1.0:
+                return
+
+            close_at_text = str(poll_state.get("close_at_text", "") or "").strip()
+            notice_text = "Poll closed automatically (scheduled closing time reached)."
+            if close_at_text:
+                notice_text = (
+                    f"Poll closed automatically at scheduled time ({close_at_text} UTC+8)."
+                )
+            await _close_tracked_native_poll(
+                bot=telegram_app.bot,
+                poll_id=token,
+                closed_by="auto_close_at",
+                notice_text=notice_text,
+            )
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print("Scheduled poll close failed for", token, ":", e)
+        finally:
+            task = SCHEDULED_POLL_CLOSE_TASKS.get(token)
+            if task is asyncio.current_task():
+                SCHEDULED_POLL_CLOSE_TASKS.pop(token, None)
+
+    SCHEDULED_POLL_CLOSE_TASKS[token] = asyncio.create_task(
+        _runner(),
+        name=f"poll-close-{token}",
+    )
+
+
+def _ensure_poll_close_schedule_for_state(
+    telegram_app: Application,
+    poll_id: str,
+    state: dict,
+) -> None:
+    if not isinstance(state, dict):
+        return
+    if state.get("closed"):
+        _cancel_scheduled_poll_close(poll_id)
+        return
+
+    close_at_ts = state.get("close_at_ts", 0)
+    try:
+        normalized_ts = float(close_at_ts or 0)
+    except (TypeError, ValueError):
+        normalized_ts = 0.0
+    if normalized_ts <= 0:
+        _cancel_scheduled_poll_close(poll_id)
+        return
+    _schedule_poll_close_task(telegram_app, poll_id, close_at_ts=normalized_ts)
+
+
 def _serialize_poll_state(state: dict) -> dict:
     choices = list(state.get("choices") or CHOICES)
     choice_count = max(2, len(choices))
@@ -1623,6 +1836,8 @@ def _serialize_poll_state(state: dict) -> dict:
         "chat_id": str(state.get("chat_id", "")),
         "message_id": str(state.get("message_id", "")),
         "cap": int(state.get("cap", 0) or 0),
+        "close_at_ts": float(state.get("close_at_ts", 0) or 0),
+        "close_at_text": str(state.get("close_at_text", "")),
         "closed": bool(state.get("closed", False)),
     }
 
@@ -1678,6 +1893,10 @@ def _deserialize_poll_state(raw: dict) -> Optional[dict]:
         cap = int(raw.get("cap", 0) or 0)
     except (TypeError, ValueError):
         cap = 0
+    try:
+        close_at_ts = float(raw.get("close_at_ts", 0) or 0)
+    except (TypeError, ValueError):
+        close_at_ts = 0.0
 
     return {
         "poll_title": poll_title,
@@ -1692,6 +1911,8 @@ def _deserialize_poll_state(raw: dict) -> Optional[dict]:
         "chat_id": str(raw.get("chat_id", "")),
         "message_id": str(raw.get("message_id", "")),
         "cap": cap,
+        "close_at_ts": close_at_ts,
+        "close_at_text": str(raw.get("close_at_text", "")),
         "closed": bool(raw.get("closed", False)),
     }
 
@@ -1736,6 +1957,8 @@ def create_poll_state(
     poll_title: Optional[str] = None,
     choices: Optional[list[tuple[str, str]]] = None,
     cap: int = 0,
+    close_at_ts: float = 0.0,
+    close_at_text: str = "",
     poll_metadata: Optional[dict[str, str]] = None,
     creator_handle: Optional[str] = None,
     creator_user_id: Optional[str] = None,
@@ -1789,6 +2012,8 @@ def create_poll_state(
         "names_row_by_user": {},   # user_id -> row number
         "next_names_row": 2,
         "cap": int(cap or 0),
+        "close_at_ts": float(close_at_ts or 0),
+        "close_at_text": str(close_at_text or "").strip(),
         "closed": False,
     }
 
@@ -1940,6 +2165,20 @@ def build_poll_prompt(query_text: str) -> tuple[str, Optional[str]]:
         "max": "cap",
         "max cap": "cap",
         "capacity": "cap",
+        "close_at": "close_at",
+        "closeat": "close_at",
+        "close at": "close_at",
+        "close": "close_at",
+        "closing": "close_at",
+        "closing at": "close_at",
+        "end": "close_at",
+        "ends": "close_at",
+        "closing_datetime": "close_at",
+        "closing_date_time": "close_at",
+        "closing_date_and_time": "close_at",
+        "closing datetime": "close_at",
+        "closing date time": "close_at",
+        "closing date and time": "close_at",
         "option1": "option1",
         "option 1": "option1",
         "choice1": "option1",
@@ -2011,6 +2250,8 @@ def build_poll_prompt(query_text: str) -> tuple[str, Optional[str]]:
             info_lines.append(f"🧘 Session: {html.escape(fields['session'])}")
         if fields.get("cap"):
             info_lines.append(f"👥 Cap: {html.escape(fields['cap'])}")
+        if fields.get("close_at"):
+            info_lines.append(f"⏳ Closes (UTC+8): {html.escape(fields['close_at'])}")
         if info_lines:
             if lines:
                 lines.append("")
@@ -2113,6 +2354,13 @@ async def _send_native_poll_and_track(
     if date_error:
         raise ValueError(date_error)
     poll_metadata["date"] = normalized_date
+    normalized_close_at, close_at_ts, close_at_error = normalize_poll_close_at_dd_mmm_yyyy_hh_mm(
+        poll_metadata.get("close_at", "")
+    )
+    if close_at_error:
+        raise ValueError(close_at_error)
+    if normalized_close_at:
+        poll_metadata["close_at"] = normalized_close_at
     poll_choices = extract_native_poll_choices(raw_body)
     poll_cap = extract_poll_cap(raw_body)
     spreadsheet_title = (poll_metadata.get("title") or extract_poll_title(raw_body) or poll_question).strip()
@@ -2141,6 +2389,8 @@ async def _send_native_poll_and_track(
             poll_title=spreadsheet_title,
             choices=poll_choices,
             cap=poll_cap,
+            close_at_ts=close_at_ts,
+            close_at_text=normalized_close_at,
             poll_metadata=poll_metadata,
             creator_handle=creator_handle,
             creator_user_id=creator_user_id,
@@ -2150,6 +2400,8 @@ async def _send_native_poll_and_track(
     poll_state["message_id"] = str(poll_msg.message_id)
     POLL_STATES[poll_key] = poll_state
     save_native_poll_states()
+    if normalized_close_at:
+        _ensure_poll_close_schedule_for_state(context.application, str(native_poll.id), poll_state)
     confirmation_lines = [
         f"poll_id: {native_poll.id}",
         f"title={spreadsheet_title}",
@@ -2354,9 +2606,12 @@ async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         votes = state.get("votes") or {}
         total_votes = len(votes)
         cap = int(state.get("cap", 0) or 0)
+        close_at_text = str(state.get("close_at_text", "") or "").strip()
         status = "closed" if state.get("closed") else "open"
         if cap > 0:
             status += f" (cap={cap})"
+        if close_at_text and not state.get("closed"):
+            status += f" (close_at={close_at_text} UTC+8)"
 
         count_parts = []
         for i, (label, _) in enumerate(choices):
@@ -2435,6 +2690,7 @@ async def forgetpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Tracked poll not found: {poll_id}")
         return
 
+    _cancel_scheduled_poll_close(poll_id)
     POLL_STATES.pop(matched_key, None)
     save_native_poll_states()
 
@@ -2517,6 +2773,9 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             line = f"poll_id={poll_id} status=tracked/{status} total_votes={total_votes}"
             if cap > 0:
                 line += f" cap={cap}"
+            close_at_text = str(state.get("close_at_text", "") or "").strip()
+            if close_at_text and not state.get("closed"):
+                line += f" close_at={close_at_text} UTC+8"
             lines.append(line)
 
             sheet_title = str(state.get("spreadsheet_title", "") or "").strip()
@@ -2590,6 +2849,82 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chunk_len += line_len
     if chunk_lines:
         await msg.reply_text("\n".join(chunk_lines))
+
+
+async def _close_tracked_native_poll(
+    *,
+    bot,
+    poll_id: str,
+    closed_by: str,
+    notice_text: str = "",
+) -> bool:
+    poll_key = ("native", str(poll_id or "").strip())
+    poll_state = POLL_STATES.get(poll_key)
+    if not isinstance(poll_state, dict):
+        return False
+    if poll_state.get("closed"):
+        _cancel_scheduled_poll_close(str(poll_id))
+        return False
+
+    chat_id = poll_state.get("chat_id")
+    message_id_raw = poll_state.get("message_id")
+    try:
+        message_id = int(message_id_raw)
+    except (TypeError, ValueError):
+        message_id = None
+    if not chat_id or message_id is None:
+        print("Native poll close skipped due to missing chat/message id:", poll_id)
+        return False
+
+    try:
+        await bot.stop_poll(chat_id=chat_id, message_id=message_id)
+    except Exception as e:
+        print("Native poll close failed for", poll_id, ":", e)
+        return False
+
+    poll_state["closed"] = True
+    _cancel_scheduled_poll_close(str(poll_id))
+    save_native_poll_states()
+
+    spreadsheet_id = str(poll_state.get("spreadsheet_id", "") or "")
+    close_date, close_time = now_utc8_date_time()
+    loop = asyncio.get_running_loop()
+    if spreadsheet_id:
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: update_poll_info_fields(
+                    SHEETS,
+                    spreadsheet_id,
+                    status="closed",
+                    poll_status="closed",
+                    date_closed=close_date,
+                    time_closed=close_time,
+                    closed_by=closed_by,
+                ),
+            )
+        except Exception as e:
+            print("Poll Info status update failed for auto-close:", e)
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: update_tracker_overview_poll_status(
+                SHEETS,
+                DRIVE,
+                poll_id=str(poll_id),
+                poll_status="closed",
+                closed_by=closed_by,
+            ),
+        )
+    except Exception as e:
+        print("Tracker overview status update failed for auto-close:", e)
+
+    if notice_text:
+        try:
+            await bot.send_message(chat_id=chat_id, text=notice_text)
+        except Exception as e:
+            print("Native poll auto-close notice failed:", e)
+    return True
 
 
 async def _stop_tracked_poll_and_remove(
@@ -2667,6 +3002,7 @@ async def _stop_tracked_poll_and_remove(
         except Exception as e:
             print("Tracker overview status update failed for stoppoll:", e)
 
+    _cancel_scheduled_poll_close(poll_id)
     POLL_STATES.pop(matched_key, None)
     save_native_poll_states()
 
@@ -2813,6 +3149,8 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll_question = _condense_poll_question(normalized_raw_body)
     poll_choices = extract_native_poll_choices(normalized_raw_body)
     poll_cap = extract_poll_cap(normalized_raw_body)
+    poll_metadata = extract_poll_metadata(normalized_raw_body)
+    poll_close_at = str(poll_metadata.get("close_at", "") or "").strip()
     poll_options = [label for label, _ in poll_choices]
     context_preview = _preview_plain_text(context_text, parse_mode)
 
@@ -2827,6 +3165,8 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preview_lines.append(f"{i}. {option}")
     if poll_cap > 0:
         preview_lines.append(f"Cap: {poll_cap}")
+    if poll_close_at:
+        preview_lines.append(f"Closes at (UTC+8): {poll_close_at}")
     preview_lines.extend(["", "Publish this poll?"])
 
     _prune_pending_publish_previews()
@@ -3196,58 +3536,12 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
 
     cap = int(poll_state.get("cap", 0) or 0)
     if not poll_state.get("closed") and cap > 0 and len(poll_state["votes"]) >= cap:
-        chat_id = poll_state.get("chat_id")
-        message_id_raw = poll_state.get("message_id")
-        try:
-            message_id = int(message_id_raw)
-        except (TypeError, ValueError):
-            message_id = None
-
-        if chat_id and message_id is not None:
-            try:
-                await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
-                poll_state["closed"] = True
-                save_native_poll_states()
-                spreadsheet_id = str(poll_state.get("spreadsheet_id", "") or "")
-                if spreadsheet_id:
-                    close_date, close_time = now_utc8_date_time()
-                    try:
-                        await loop.run_in_executor(
-                            None,
-                            lambda: update_poll_info_fields(
-                                SHEETS,
-                                spreadsheet_id,
-                                status="closed",
-                                poll_status="closed",
-                                date_closed=close_date,
-                                time_closed=close_time,
-                                closed_by="auto_cap",
-                            ),
-                        )
-                    except Exception as e:
-                        print("Poll Info status update failed for auto-close:", e)
-                try:
-                    await loop.run_in_executor(
-                        None,
-                        lambda: update_tracker_overview_poll_status(
-                            SHEETS,
-                            DRIVE,
-                            poll_id=str(answer.poll_id),
-                            poll_status="closed",
-                            closed_by="auto_cap",
-                        ),
-                    )
-                except Exception as e:
-                    print("Tracker overview status update failed for auto-close:", e)
-                try:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=f"Poll closed automatically (cap reached: {cap}).",
-                    )
-                except Exception as e:
-                    print("Native poll cap-close notice failed:", e)
-            except Exception as e:
-                print("Native poll auto-close failed:", e)
+        await _close_tracked_native_poll(
+            bot=context.bot,
+            poll_id=str(answer.poll_id),
+            closed_by="auto_cap",
+            notice_text=f"Poll closed automatically (cap reached: {cap}).",
+        )
 
 
 def initialize_runtime_services():
@@ -3312,8 +3606,21 @@ def initialize_runtime_services():
             print("Member check CSV not loaded:", MEMBER_CHECK_CSV_PATH)
 
 
+async def _on_telegram_app_post_init(telegram_app: Application) -> None:
+    for key, state in list(POLL_STATES.items()):
+        if not (isinstance(key, tuple) and len(key) == 2 and key[0] == "native"):
+            continue
+        poll_id = str(key[1])
+        _ensure_poll_close_schedule_for_state(telegram_app, poll_id, state)
+
+
 def build_telegram_application() -> Application:
-    telegram_app = Application.builder().token(BOT_TOKEN).build()
+    telegram_app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(_on_telegram_app_post_init)
+        .build()
+    )
     telegram_app.add_handler(CommandHandler("start", with_allowed_user_check(start)))
     telegram_app.add_handler(CommandHandler("startall", with_allowed_user_check(startall)))
     telegram_app.add_handler(CommandHandler("sample", with_allowed_user_check(sample)))
