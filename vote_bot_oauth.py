@@ -158,8 +158,8 @@ TRACKER_OVERVIEW_HEADERS = [
 PUBLISHPOLL_SAMPLE_TEMPLATE = (
     "/publishpoll\n"
     "title=<Enter event title here>\n"
-    "date=22-Feb-2026\n"
-    "close_at=22-Feb-2026 18:00\n"
+    "date=31-Dec-2099\n"
+    "close_at=31-Dec-2099 23:59\n"
     "desc=<Write a short description of the event>\n"
     "venue=<Enter event location here>\n"
     "lunch=12:30-2pm\n"
@@ -172,15 +172,15 @@ PUBLISHPOLL_SAMPLE_TEMPLATE = (
 PUBLISHPOLL_MINIMAL_TEMPLATE = (
     "/publishpoll\n"
     "title=<Enter event title here>\n"
-    "date=22-Feb-2026\n\n"
+    "date=31-Dec-2099\n\n"
 )
 
 PUBLISHPOLL_SITS_TEMPLATE = (
     "/publishpoll\n"
     "title=DAYWA guided meditation session\n"
     "Description = Join us for online 30 mins guided meditation! Indicate your availability by closing date and time, or when slots are filled!\n"
-    "date=22-Feb-2026\n"
-    "close_at=23-Feb-2026 18:00\n"
+    "date=31-Dec-2099\n"
+    "close_at=31-Dec-2099 23:59\n"
     "Option1 = Yes, joining!\n"
     "Option2 = Yes and I'm new to DAYWA!\n"
     "Option3 = Joining from RISE, Penang!\n"
@@ -196,8 +196,8 @@ PUBLISHPOLL_SAMPLE_GUIDE = (
     "4. Review the preview, then tap Publish.\n\n"
     "Some rules:\n"
     "- Use one key per line in key=value or key:value format.\n"
-    "- date is required and must be DD-MMM-YYYY (example: 22-Feb-2026).\n"
-    "- close_at is optional and must be DD-MMM-YYYY HH:MM in UTC+8 (example: 22-Feb-2026 18:00).\n"
+    "- date is required and must be DD-MMM-YYYY (example: 22-Feb-2026) and must be later than current date.\n"
+    "- close_at is optional and must be DD-MMM-YYYY HH:MM in UTC+8 (example: 22-Feb-2026 18:00). Must be later than current date time.\n"
     "- option1 (discussion session) and option2 (discussion session + lunch) are used by default if not provided.\n"
     "- option3 and option4 are optional and only used when filled.\n"
     "- cap is optional; if cap > 0, poll auto-closes at max votes; if not provided, poll has to be manually closed\n"
