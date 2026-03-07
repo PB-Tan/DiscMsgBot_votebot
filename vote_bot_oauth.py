@@ -184,6 +184,7 @@ PUBLISHPOLL_SITS_TEMPLATE = (
     "Option1 = Yes, joining!\n"
     "Option2 = Yes and I'm new to DAYWA!\n"
     "Option3 = Joining from RISE, Penang!\n"
+    "Lunch2 = No\n"
     "cap = 30\n\n"
 )
 
