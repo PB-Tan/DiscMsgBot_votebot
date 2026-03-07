@@ -179,6 +179,8 @@ PUBLISHPOLL_SITS_TEMPLATE = (
     "/publishpoll\n"
     "title=DAYWA guided meditation session\n"
     "Description = Join us for online 30 mins guided meditation! Indicate your availability by closing date and time, or when slots are filled!\n"
+    "Venue = Zoom\n"
+    "Session = 8 - 9:30pm\n"
     "date=31-Dec-2099\n"
     "close_at=31-Dec-2099 23:59\n"
     "Option1 = Yes, joining!\n"
