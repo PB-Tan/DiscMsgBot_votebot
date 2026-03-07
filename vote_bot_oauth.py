@@ -903,6 +903,67 @@ def normalize_poll_close_at_dd_mmm_yyyy_hh_mm(value: str) -> tuple[str, float, O
     return normalized, float(close_dt.timestamp()), None
 
 
+def validate_poll_timing_is_future(
+    *,
+    normalized_date: str,
+    normalized_close_at: str = "",
+    close_at_ts: float = 0.0,
+) -> Optional[str]:
+    month_abbr_to_num = {
+        "jan": 1,
+        "feb": 2,
+        "mar": 3,
+        "apr": 4,
+        "may": 5,
+        "jun": 6,
+        "jul": 7,
+        "aug": 8,
+        "sep": 9,
+        "oct": 10,
+        "nov": 11,
+        "dec": 12,
+    }
+    now_dt = datetime.now(UTC8)
+    now_ts = now_dt.timestamp()
+
+    try:
+        day_text, month_text, year_text = (normalized_date or "").split("-")
+    except ValueError:
+        return (
+            f"Invalid date format: {normalized_date}. "
+            "Use DD-MMM-YYYY (example: 22-Feb-2026)."
+        )
+    month_num = month_abbr_to_num.get(month_text.lower())
+    if month_num is None:
+        return (
+            f"Invalid date format: {normalized_date}. "
+            "Use DD-MMM-YYYY (example: 22-Feb-2026)."
+        )
+    try:
+        event_dt = datetime(int(year_text), month_num, int(day_text), tzinfo=UTC8)
+    except ValueError:
+        return (
+            f"Invalid date format: {normalized_date}. "
+            "Use DD-MMM-YYYY (example: 22-Feb-2026)."
+        )
+    if event_dt.timestamp() <= now_ts:
+        return (
+            f"Invalid date: {normalized_date}. "
+            "Event date must be later than current datetime (UTC+8)."
+        )
+
+    if close_at_ts > 0 and close_at_ts <= now_ts:
+        close_at_text = str(normalized_close_at or "").strip()
+        if close_at_text:
+            return (
+                f"Invalid close_at: {close_at_text}. "
+                "close_at must be later than current datetime (UTC+8)."
+            )
+        return "Invalid close_at: close_at must be later than current datetime (UTC+8)."
+
+    return None
+
+
 def _append_or_override_date_in_raw_body(raw_body: str, normalized_date: str) -> str:
     text = (raw_body or "").strip()
     if not normalized_date:
@@ -937,11 +998,18 @@ def validate_publishpoll_required_fields(
     poll_metadata["title"] = poll_title
     poll_metadata["date"] = normalized_date
     normalized_raw_body = _append_or_override_date_in_raw_body(raw_body, normalized_date)
-    normalized_close_at, _, close_at_error = normalize_poll_close_at_dd_mmm_yyyy_hh_mm(
+    normalized_close_at, close_at_ts, close_at_error = normalize_poll_close_at_dd_mmm_yyyy_hh_mm(
         poll_metadata.get("close_at", "")
     )
     if close_at_error:
         return None, "", "", close_at_error
+    timing_error = validate_poll_timing_is_future(
+        normalized_date=normalized_date,
+        normalized_close_at=normalized_close_at,
+        close_at_ts=close_at_ts,
+    )
+    if timing_error:
+        return None, "", "", timing_error
     if normalized_close_at:
         poll_metadata["close_at"] = normalized_close_at
         normalized_raw_body = _append_or_override_close_at_in_raw_body(
@@ -1371,12 +1439,12 @@ def update_tally(sheets, spreadsheet_id: str, choices: list[tuple[str, str]], co
 
 
 POLL_INFO_KEY_ROWS = {
-    "poll_id": 6,
-    "status": 7,
-    "poll_status": 7,
-    "date_closed": 0,
-    "time_closed": 0,
-    "closed_by": 0,
+    "poll_id": 4,
+    "poll_status": 8,
+    "status": 9,
+    "date_closed": 13,
+    "time_closed": 14,
+    "closed_by": 15,
 }
 
 
@@ -1774,7 +1842,7 @@ def _schedule_poll_close_task(
             await _close_tracked_native_poll(
                 bot=telegram_app.bot,
                 poll_id=token,
-                closed_by="auto_close_at",
+                closed_by="scheduler",
                 notice_text=notice_text,
             )
         except asyncio.CancelledError:
@@ -2360,6 +2428,13 @@ async def _send_native_poll_and_track(
     )
     if close_at_error:
         raise ValueError(close_at_error)
+    timing_error = validate_poll_timing_is_future(
+        normalized_date=normalized_date,
+        normalized_close_at=normalized_close_at,
+        close_at_ts=close_at_ts,
+    )
+    if timing_error:
+        raise ValueError(timing_error)
     if normalized_close_at:
         poll_metadata["close_at"] = normalized_close_at
     poll_choices = extract_native_poll_choices(raw_body)
