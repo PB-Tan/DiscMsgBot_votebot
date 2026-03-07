@@ -946,10 +946,10 @@ def validate_poll_timing_is_future(
             f"Invalid date format: {normalized_date}. "
             "Use DD-MMM-YYYY (example: 22-Feb-2026)."
         )
-    if event_dt.timestamp() <= now_ts:
+    if event_dt.date() < now_dt.date():
         return (
             f"Invalid date: {normalized_date}. "
-            "Event date must be later than current datetime (UTC+8)."
+            "Event date cannot be earlier than current date (UTC+8)."
         )
 
     if close_at_ts > 0 and close_at_ts <= now_ts:
