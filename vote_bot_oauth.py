@@ -178,7 +178,7 @@ PUBLISHPOLL_MINIMAL_TEMPLATE = (
 PUBLISHPOLL_SITS_TEMPLATE = (
     "/publishpoll\n"
     "title=DAYWA guided meditation session\n"
-    "Description = Join us for online 30 mins guided meditation! Indicate your availability by (closing date), or when slots are filled!\n"
+    "Description = Join us for online 30 mins guided meditation! Indicate your availability by closing date and time, or when slots are filled!\n"
     "date=22-Feb-2026\n"
     "close_at=23-Feb-2026 18:00\n"
     "Option1 = Yes, joining!\n"
@@ -2251,7 +2251,7 @@ def build_poll_prompt(query_text: str) -> tuple[str, Optional[str]]:
         if fields.get("cap"):
             info_lines.append(f"👥 Cap: {html.escape(fields['cap'])}")
         if fields.get("close_at"):
-            info_lines.append(f"⏳ Closes (UTC+8): {html.escape(fields['close_at'])}")
+            info_lines.append(f"⏳ Closes: {html.escape(fields['close_at'])}")
         if info_lines:
             if lines:
                 lines.append("")
