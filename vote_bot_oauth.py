@@ -2548,9 +2548,11 @@ async def _send_tracked_poll_message_and_track(
     context: ContextTypes.DEFAULT_TYPE,
     *,
     chat_id,
+    confirmation_chat_id=None,
     raw_body: str,
     actor_user,
 ):
+    confirmation_chat_id = confirmation_chat_id if confirmation_chat_id is not None else chat_id
     poll_question = _condense_poll_question(raw_body)
     message_text, message_parse_mode = build_tracked_poll_message(raw_body)
     poll_metadata = extract_poll_metadata(raw_body)
@@ -2623,7 +2625,7 @@ async def _send_tracked_poll_message_and_track(
             folder_url = f"https://drive.google.com/drive/folders/{folder_url}"
         confirmation_lines.append(f"Drive folder: {folder_url}")
     await context.bot.send_message(
-        chat_id=chat_id,
+        chat_id=confirmation_chat_id,
         text="\n".join(confirmation_lines),
     )
     return poll_state
@@ -3656,6 +3658,7 @@ async def on_publishpoll_preview_action(update: Update, context: ContextTypes.DE
         await _send_tracked_poll_message_and_track(
             context,
             chat_id=target_chat,
+            confirmation_chat_id=query.message.chat_id,
             raw_body=str(pending.get("raw_body", "")),
             actor_user=query.from_user,
         )
