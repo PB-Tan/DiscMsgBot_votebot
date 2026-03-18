@@ -46,6 +46,7 @@ MEMBER_RAW_EXISTING_GENDER_RANGE = os.environ.get("MEMBER_RAW_EXISTING_GENDER_RA
 MEMBER_RAW_NEWCOMER_HANDLE_RANGE = os.environ.get("MEMBER_RAW_NEWCOMER_HANDLE_RANGE", "DAYWA Newcomers List!F2:F").strip()
 MEMBER_RAW_NEWCOMER_GENDER_RANGE = os.environ.get("MEMBER_RAW_NEWCOMER_GENDER_RANGE", "DAYWA Newcomers List!G2:G").strip()
 NATIVE_POLL_STATE_FILE = os.environ.get("NATIVE_POLL_STATE_FILE", "native_poll_states.json").strip() or "native_poll_states.json"
+DEFAULT_PUBLISH_CHAT = os.environ.get("DEFAULT_PUBLISH_CHAT", "").strip()
 ALLOWED_TELEGRAM_USER_IDS_RAW = os.environ.get("ALLOWED_TELEGRAM_USER_IDS", "").strip()
 
 SCOPES = [
@@ -157,6 +158,7 @@ TRACKER_OVERVIEW_HEADERS = [
 
 PUBLISHPOLL_SAMPLE_TEMPLATE = (
     "/publishpoll\n"
+    "channel=@yourchannel\n"
     "title=<Enter event title here>\n"
     "date=31-Dec-2099\n"
     "close_at=31-Dec-2099 23:59\n"
@@ -171,12 +173,14 @@ PUBLISHPOLL_SAMPLE_TEMPLATE = (
 
 PUBLISHPOLL_MINIMAL_TEMPLATE = (
     "/publishpoll\n"
+    "channel=@yourchannel\n"
     "title=<Enter event title here>\n"
     "date=31-Dec-2099\n\n"
 )
 
 PUBLISHPOLL_SITS_TEMPLATE = (
     "/publishpoll\n"
+    "channel=@yourchannel\n"
     "title=DAYWA guided meditation session\n"
     "Description = Join us for online 30 mins guided meditation! Indicate your availability by closing date and time, or when slots are filled!\n"
     "Venue = Zoom\n"
@@ -205,6 +209,8 @@ PUBLISHPOLL_SAMPLE_GUIDE = (
     "- cap is optional; if cap > 0, poll auto-closes at max votes; if not provided, poll has to be manually closed\n"
     "- lunch1..lunch4 are optional lunch flags per option.\n"
     "- lunch1 (No) and lunch2 (Yes) are the default values if not provided.\n\n"
+    "- channel / publish_to / target_chat is optional; use @channelusername or a numeric chat id to publish directly into another chat/channel.\n"
+    f"- DEFAULT_PUBLISH_CHAT={DEFAULT_PUBLISH_CHAT or '<not set>'} is used when no target is provided.\n\n"
     "Minimal template:\n"
     f"{PUBLISHPOLL_MINIMAL_TEMPLATE}"
     "Sits template:\n"
@@ -773,6 +779,16 @@ def extract_poll_metadata(raw_text: str) -> dict[str, str]:
         "lunch 3": "lunch3",
         "lunch4": "lunch4",
         "lunch 4": "lunch4",
+        "channel": "target_chat",
+        "target_chat": "target_chat",
+        "target chat": "target_chat",
+        "publish_to": "target_chat",
+        "publish to": "target_chat",
+        "post_to": "target_chat",
+        "post to": "target_chat",
+        "chat": "target_chat",
+        "chat_id": "target_chat",
+        "chat id": "target_chat",
     }
     out: dict[str, str] = {}
     for part in parts:
@@ -1020,6 +1036,44 @@ def validate_publishpoll_required_fields(
     return poll_metadata, poll_title, normalized_raw_body, None
 
 
+def normalize_publish_target_chat(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    tme_match = re.fullmatch(r"https?://t\.me/([A-Za-z0-9_]{5,})/?", raw, flags=re.IGNORECASE)
+    if tme_match:
+        return f"@{tme_match.group(1)}"
+    if re.fullmatch(r"-?\d+", raw):
+        try:
+            return str(int(raw))
+        except ValueError:
+            return raw
+    if raw.startswith("@") and re.fullmatch(r"@[A-Za-z0-9_]{5,}", raw):
+        return raw
+    return raw
+
+
+def resolve_publish_target_chat(raw_body: str, fallback_chat_id: Any) -> str:
+    poll_metadata = extract_poll_metadata(raw_body)
+    explicit_target = normalize_publish_target_chat(poll_metadata.get("target_chat", ""))
+    if explicit_target:
+        return explicit_target
+    default_target = normalize_publish_target_chat(DEFAULT_PUBLISH_CHAT)
+    if default_target:
+        return default_target
+    return normalize_publish_target_chat(fallback_chat_id)
+
+
+def describe_publish_target_chat(target_chat: str, fallback_chat_id: Any) -> str:
+    normalized_fallback = normalize_publish_target_chat(fallback_chat_id)
+    normalized_target = normalize_publish_target_chat(target_chat)
+    if not normalized_target:
+        return "(unresolved)"
+    if normalized_fallback and normalized_target == normalized_fallback:
+        return "this chat"
+    return normalized_target
+
+
 def build_poll_info_rows(
     *,
     file_title: str,
@@ -1092,6 +1146,7 @@ def build_poll_info_rows(
         ["lunch2", meta.get("lunch2", "")],
         ["lunch3", meta.get("lunch3", "")],
         ["lunch4", meta.get("lunch4", "")],
+        ["target_chat", meta.get("target_chat", "")],
     ]
     return rows
 
@@ -2177,6 +2232,16 @@ def extract_native_poll_choices(raw_text: str) -> list[tuple[str, str]]:
         "lunch 3": "lunch3",
         "lunch4": "lunch4",
         "lunch 4": "lunch4",
+        "channel": "target_chat",
+        "target_chat": "target_chat",
+        "target chat": "target_chat",
+        "publish_to": "target_chat",
+        "publish to": "target_chat",
+        "post_to": "target_chat",
+        "post to": "target_chat",
+        "chat": "target_chat",
+        "chat_id": "target_chat",
+        "chat id": "target_chat",
     }
     for part in parts:
         sep = "=" if "=" in part else ":"
@@ -2549,6 +2614,7 @@ async def _send_tracked_poll_message_and_track(
     confirmation_lines = [
         f"poll_id: {poll_id}",
         f"title={spreadsheet_title}",
+        f"posted_to={chat_id}",
         f"Tracking sheet (internal circulation): {poll_state['spreadsheet_url']}",
     ]
     if DRIVE_FOLDER_ID:
@@ -3496,10 +3562,15 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     poll_cap = extract_poll_cap(normalized_raw_body)
     poll_metadata = extract_poll_metadata(normalized_raw_body)
     poll_close_at = str(poll_metadata.get("close_at", "") or "").strip()
+    target_chat = resolve_publish_target_chat(normalized_raw_body, msg.chat_id)
+    target_chat_label = describe_publish_target_chat(target_chat, msg.chat_id)
     poll_options = [label for label, _ in poll_choices]
     context_preview = _preview_plain_text(context_text, parse_mode)
 
     preview_lines = ["Preview only (not published yet)"]
+    preview_lines.extend(["", f"Publish to: {target_chat_label}"])
+    if target_chat_label != "this chat":
+        preview_lines.append("Bot must already have permission to post there.")
     if context_preview:
         preview_lines.extend(["", "Poll details:", context_preview])
     else:
@@ -3519,6 +3590,7 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     PENDING_PUBLISH_PREVIEWS[token] = {
         "raw_body": normalized_raw_body,
         "chat_id": str(msg.chat_id),
+        "target_chat": str(target_chat),
         "user_id": str(msg.from_user.id) if msg.from_user else "",
         "created_ts": time.time(),
     }
@@ -3576,10 +3648,14 @@ async def on_publishpoll_preview_action(update: Update, context: ContextTypes.DE
     if not query.message:
         return
 
+    target_chat = normalize_publish_target_chat(pending.get("target_chat", ""))
+    if not target_chat:
+        target_chat = resolve_publish_target_chat(str(pending.get("raw_body", "")), query.message.chat_id)
+
     try:
         await _send_tracked_poll_message_and_track(
             context,
-            chat_id=query.message.chat_id,
+            chat_id=target_chat,
             raw_body=str(pending.get("raw_body", "")),
             actor_user=query.from_user,
         )

@@ -23,6 +23,7 @@ It supports:
 Example `/publishpoll` body:
 
 ```text
+channel=@yourchannel
 title=DAYWA Discussions
 desc=Join us for an afternoon...
 date=23 Feb 2026
@@ -166,6 +167,7 @@ Without a persistent disk:
 ## Optional Environment Variables
 
 Useful optional settings:
+- `DEFAULT_PUBLISH_CHAT` - default destination chat/channel for `/publishpoll` (for example `@yourchannel` or `-1001234567890`)
 - `DRIVE_FOLDER_ID` - parent folder for created sheets
 - `SHEET_LINK_SHARE_ROLE` - `reader`, `commenter`, or `writer`
 - `SHEET_LINK_ALLOW_DISCOVERY` - `true`/`false`
