@@ -4,7 +4,7 @@ A Telegram voting bot for DAYWA-style session signups.
 
 It supports:
 - Inline 2-option voting (via inline mode)
-- Native Telegram polls with optional capacity (`/publishpoll`)
+- Interactive Telegram vote messages with optional capacity (`/publishpoll`)
 - Automatic Google Sheets tracking (one sheet per poll)
 - Optional member-check enrichment from CSV or Google Sheets
 
@@ -18,7 +18,7 @@ It supports:
 
 - `/start` - bot help
 - `/sample` - show a `/publishpoll` template
-- `/publishpoll` - create a Telegram native poll and tracking sheet
+- `/publishpoll` - create an interactive Telegram vote message and tracking sheet
 
 Example `/publishpoll` body:
 

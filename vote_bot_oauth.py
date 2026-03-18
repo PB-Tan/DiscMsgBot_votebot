@@ -1735,7 +1735,8 @@ def upsert_name_result(
 # --------------------
 # Telegram bot
 # --------------------
-POLL_STATES = {}  # ("native", poll_id) -> state
+TRACKED_POLL_KINDS = {"native", "inline"}
+POLL_STATES = {}  # (kind, poll_id) -> state
 PENDING_PUBLISH_PREVIEWS = {}  # token -> {raw_body, chat_id, user_id, created_ts}
 PENDING_STOPPOLL_CONFIRMATIONS = {}  # token -> {poll_id, chat_id, user_id, created_ts}
 PENDING_STOPPOLL_PICKERS = {}  # token -> {poll_ids, chat_id, user_id, created_ts}
@@ -1746,6 +1747,30 @@ SHEETS = None
 DRIVE = None
 TRACKER_OVERVIEW_SPREADSHEET_ID = ""
 PUBLISH_PREVIEW_TTL_SECONDS = 15 * 60
+
+
+def _iter_tracked_poll_states():
+    for key, state in POLL_STATES.items():
+        if not (isinstance(key, tuple) and len(key) == 2 and key[0] in TRACKED_POLL_KINDS):
+            continue
+        yield key, state
+
+
+def _tracked_poll_items() -> list[tuple[str, str, dict]]:
+    items = []
+    for key, state in _iter_tracked_poll_states():
+        items.append((str(key[0]), str(key[1]), state))
+    return items
+
+
+def _find_tracked_poll(poll_id: str) -> tuple[Optional[tuple[str, Any]], Optional[dict]]:
+    wanted = str(poll_id or "").strip()
+    if not wanted:
+        return None, None
+    for key, state in _iter_tracked_poll_states():
+        if str(key[1]) == wanted:
+            return key, state
+    return None, None
 
 
 def _prune_pending_publish_previews() -> None:
@@ -1824,7 +1849,7 @@ def _schedule_poll_close_task(
             if delay > 0:
                 await asyncio.sleep(delay)
 
-            poll_state = POLL_STATES.get(("native", token))
+            _, poll_state = _find_tracked_poll(token)
             if not isinstance(poll_state, dict) or poll_state.get("closed"):
                 return
 
@@ -1841,7 +1866,7 @@ def _schedule_poll_close_task(
                 notice_text = (
                     f"Poll closed automatically at scheduled time ({close_at_text} UTC+8)."
                 )
-            await _close_tracked_native_poll(
+            await _close_tracked_poll(
                 bot=telegram_app.bot,
                 poll_id=token,
                 closed_by="scheduler",
@@ -1899,6 +1924,8 @@ def _serialize_poll_state(state: dict) -> dict:
         "spreadsheet_id": str(state.get("spreadsheet_id", "")),
         "spreadsheet_url": str(state.get("spreadsheet_url", "")),
         "spreadsheet_title": str(state.get("spreadsheet_title", "")),
+        "message_text": str(state.get("message_text", "")),
+        "message_parse_mode": str(state.get("message_parse_mode", "")),
         "choices": [[str(label), str(lunch)] for label, lunch in choices],
         "votes": {str(k): int(v) for k, v in state.get("votes", {}).items()},
         "counts": counts,
@@ -1974,6 +2001,8 @@ def _deserialize_poll_state(raw: dict) -> Optional[dict]:
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
         "spreadsheet_title": spreadsheet_title,
+        "message_text": str(raw.get("message_text", "")),
+        "message_parse_mode": str(raw.get("message_parse_mode", "")),
         "choices": choices,
         "votes": votes,
         "counts": counts,
@@ -1989,11 +2018,10 @@ def _deserialize_poll_state(raw: dict) -> Optional[dict]:
 
 
 def save_native_poll_states() -> None:
-    payload = {"native_polls": {}}
-    for key, state in POLL_STATES.items():
-        if not isinstance(key, tuple) or len(key) != 2 or key[0] != "native":
-            continue
-        payload["native_polls"][str(key[1])] = _serialize_poll_state(state)
+    payload = {"native_polls": {}, "inline_polls": {}}
+    for key, state in _iter_tracked_poll_states():
+        bucket = "native_polls" if key[0] == "native" else "inline_polls"
+        payload[bucket][str(key[1])] = _serialize_poll_state(state)
 
     with open(NATIVE_POLL_STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True)
@@ -2006,20 +2034,20 @@ def load_native_poll_states() -> int:
         with open(NATIVE_POLL_STATE_FILE, "r", encoding="utf-8") as f:
             payload = json.load(f)
     except Exception as e:
-        print("Native poll state load failed:", e)
-        return 0
-
-    native_polls = payload.get("native_polls", {})
-    if not isinstance(native_polls, dict):
+        print("Tracked poll state load failed:", e)
         return 0
 
     restored = 0
-    for poll_id, raw_state in native_polls.items():
-        state = _deserialize_poll_state(raw_state)
-        if not state:
+    for bucket_name, kind in (("native_polls", "native"), ("inline_polls", "inline")):
+        poll_map = payload.get(bucket_name, {})
+        if not isinstance(poll_map, dict):
             continue
-        POLL_STATES[("native", str(poll_id))] = state
-        restored += 1
+        for poll_id, raw_state in poll_map.items():
+            state = _deserialize_poll_state(raw_state)
+            if not state:
+                continue
+            POLL_STATES[(kind, str(poll_id))] = state
+            restored += 1
     return restored
 
 
@@ -2035,9 +2063,9 @@ def create_poll_state(
     creator_user_id: Optional[str] = None,
 ):
     poll_choices = list(choices or CHOICES)
-    native_poll_id = ""
-    if isinstance(poll_key, tuple) and len(poll_key) == 2 and poll_key[0] == "native":
-        native_poll_id = str(poll_key[1])
+    tracked_poll_id = ""
+    if isinstance(poll_key, tuple) and len(poll_key) == 2:
+        tracked_poll_id = str(poll_key[1])
     spreadsheet_id, spreadsheet_url, spreadsheet_title = create_new_spreadsheet(
         SHEETS,
         DRIVE,
@@ -2046,7 +2074,7 @@ def create_poll_state(
         poll_metadata=poll_metadata,
         creator_handle=creator_handle,
         creator_user_id=creator_user_id,
-        poll_id=native_poll_id,
+        poll_id=tracked_poll_id,
         poll_status="open",
     )
     poll_date = ""
@@ -2058,7 +2086,7 @@ def create_poll_state(
         upsert_tracker_overview_row(
             SHEETS,
             DRIVE,
-            poll_id=native_poll_id,
+            poll_id=tracked_poll_id,
             poll_title=str(poll_title or "").strip(),
             poll_date=poll_date,
             gsheet_url=spreadsheet_url,
@@ -2077,6 +2105,8 @@ def create_poll_state(
         "spreadsheet_id": spreadsheet_id,
         "spreadsheet_url": spreadsheet_url,
         "spreadsheet_title": spreadsheet_title,
+        "message_text": "",
+        "message_parse_mode": "",
         "choices": poll_choices,
         "votes": {},               # user_id -> choice_idx
         "counts": [0] * len(poll_choices),
@@ -2341,6 +2371,43 @@ def build_poll_prompt(query_text: str) -> tuple[str, Optional[str]]:
     return "Please vote:\n" + "\n".join(parts), None
 
 
+def build_tracked_poll_message(raw_body: str) -> tuple[str, Optional[str]]:
+    poll_prompt, parse_mode = build_poll_prompt(raw_body)
+    context_text = strip_prompt_line(poll_prompt, parse_mode)
+    base_text = context_text.strip() if context_text.strip() else _condense_poll_question(raw_body)
+    instruction_html = (
+        "<i>Tap an option below to vote. Tap the same option again to withdraw.</i>"
+    )
+    instruction_plain = "Tap an option below to vote. Tap the same option again to withdraw."
+    if parse_mode == "HTML":
+        return f"{base_text}\n\n{instruction_html}", "HTML"
+    return f"{base_text}\n\n{instruction_plain}", None
+
+
+def closed_tracked_poll_message(text: str, parse_mode: Optional[str]) -> str:
+    base_text = (text or "").strip()
+    close_suffix = "<i>Voting closed.</i>" if parse_mode == "HTML" else "Voting closed."
+    if not base_text:
+        return close_suffix
+    if close_suffix in base_text:
+        return base_text
+    return f"{base_text}\n\n{close_suffix}"
+
+
+def tracked_poll_keyboard(poll_id: str, poll_state: dict) -> InlineKeyboardMarkup:
+    rows = []
+    choices = list(poll_state.get("choices") or CHOICES)
+    counts = list(poll_state.get("counts") or [])
+    for idx, (label, _) in enumerate(choices):
+        try:
+            count_val = int(counts[idx])
+        except (IndexError, TypeError, ValueError):
+            count_val = 0
+        button_text = f"{label} ({count_val})"
+        rows.append([InlineKeyboardButton(button_text, callback_data=f"pv|{poll_id}|{idx}")])
+    return InlineKeyboardMarkup(rows)
+
+
 def publishpoll_preview_keyboard(token: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -2412,7 +2479,7 @@ def _condense_poll_question(raw_body: str, max_len: int = 300) -> str:
     return out
 
 
-async def _send_native_poll_and_track(
+async def _send_tracked_poll_message_and_track(
     context: ContextTypes.DEFAULT_TYPE,
     *,
     chat_id,
@@ -2420,6 +2487,7 @@ async def _send_native_poll_and_track(
     actor_user,
 ):
     poll_question = _condense_poll_question(raw_body)
+    message_text, message_parse_mode = build_tracked_poll_message(raw_body)
     poll_metadata = extract_poll_metadata(raw_body)
     normalized_date, date_error = normalize_poll_date_dd_mmm_yyyy(poll_metadata.get("date", ""))
     if date_error:
@@ -2444,21 +2512,8 @@ async def _send_native_poll_and_track(
     spreadsheet_title = (poll_metadata.get("title") or extract_poll_title(raw_body) or poll_question).strip()
     creator_handle = f"@{actor_user.username}" if actor_user and getattr(actor_user, "username", None) else ""
     creator_user_id = str(actor_user.id) if actor_user else ""
-    poll_options = [label for label, _ in poll_choices]
-
-    poll_msg = await context.bot.send_poll(
-        chat_id=chat_id,
-        question=poll_question[:300],
-        options=poll_options,
-        is_anonymous=False,
-        allows_multiple_answers=False,
-    )
-
-    native_poll = getattr(poll_msg, "poll", None)
-    if not (native_poll and native_poll.id):
-        return None
-
-    poll_key = ("native", native_poll.id)
+    poll_id = uuid.uuid4().hex
+    poll_key = ("inline", poll_id)
     loop = asyncio.get_running_loop()
     poll_state = await loop.run_in_executor(
         None,
@@ -2474,14 +2529,25 @@ async def _send_native_poll_and_track(
             creator_user_id=creator_user_id,
         ),
     )
+    poll_state["message_text"] = message_text
+    poll_state["message_parse_mode"] = str(message_parse_mode or "")
+
+    poll_msg = await context.bot.send_message(
+        chat_id=chat_id,
+        text=message_text,
+        parse_mode=message_parse_mode,
+        reply_markup=tracked_poll_keyboard(poll_id, poll_state),
+        disable_web_page_preview=True,
+    )
+
     poll_state["chat_id"] = str(poll_msg.chat_id)
     poll_state["message_id"] = str(poll_msg.message_id)
     POLL_STATES[poll_key] = poll_state
     save_native_poll_states()
     if normalized_close_at:
-        _ensure_poll_close_schedule_for_state(context.application, str(native_poll.id), poll_state)
+        _ensure_poll_close_schedule_for_state(context.application, poll_id, poll_state)
     confirmation_lines = [
-        f"poll_id: {native_poll.id}",
+        f"poll_id: {poll_id}",
         f"title={spreadsheet_title}",
         f"Tracking sheet (internal circulation): {poll_state['spreadsheet_url']}",
     ]
@@ -2495,6 +2561,192 @@ async def _send_native_poll_and_track(
         text="\n".join(confirmation_lines),
     )
     return poll_state
+
+
+async def _refresh_member_index_if_due(loop) -> None:
+    global MEMBER_INDEX, MEMBER_INDEX_LAST_REFRESH_TS
+    if not (MEMBER_RAW_SOURCE or MEMBER_CHECK_SOURCE):
+        return
+
+    now = time.time()
+    refresh_due = (
+        MEMBER_INDEX_LAST_REFRESH_TS <= 0
+        or MEMBER_CHECK_REFRESH_SECONDS <= 0
+        or (now - MEMBER_INDEX_LAST_REFRESH_TS) >= MEMBER_CHECK_REFRESH_SECONDS
+    )
+    if not refresh_due:
+        return
+
+    try:
+        if MEMBER_RAW_SOURCE:
+            MEMBER_INDEX = await loop.run_in_executor(
+                None,
+                lambda: load_member_check_index_from_raw_source(SHEETS, MEMBER_RAW_SOURCE),
+            )
+        else:
+            MEMBER_INDEX = await loop.run_in_executor(
+                None,
+                lambda: load_member_check_index_from_sheet(SHEETS, MEMBER_CHECK_SOURCE, MEMBER_CHECK_TAB),
+            )
+        MEMBER_INDEX_LAST_REFRESH_TS = time.time()
+    except Exception as e:
+        print("Member check live refresh failed:", e)
+
+
+async def _refresh_inline_poll_message(
+    bot,
+    poll_id: str,
+    poll_state: dict,
+) -> None:
+    if poll_state.get("closed"):
+        return
+    chat_id = poll_state.get("chat_id")
+    message_id_raw = poll_state.get("message_id")
+    try:
+        message_id = int(message_id_raw)
+    except (TypeError, ValueError):
+        message_id = None
+    if not chat_id or message_id is None:
+        return
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=message_id,
+            reply_markup=tracked_poll_keyboard(poll_id, poll_state),
+        )
+    except Exception as e:
+        if "message is not modified" not in str(e).lower():
+            print("Inline poll message refresh failed for", poll_id, ":", e)
+
+
+async def _apply_vote_selection(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    poll_id: str,
+    poll_state: dict,
+    user,
+    selected_idx: Optional[int],
+    same_selection_withdraw: bool,
+) -> str:
+    loop = asyncio.get_running_loop()
+    await _refresh_member_index_if_due(loop)
+
+    poll_choices = poll_state.get("choices", list(CHOICES))
+    prev_idx = poll_state["votes"].get(user.id)
+
+    if selected_idx is None:
+        if prev_idx is None:
+            return "You do not have an active vote."
+        del poll_state["votes"][user.id]
+        poll_state["counts"][prev_idx] -= 1
+        action = "Cancelled vote"
+        new_choice_text = "CANCELLED"
+        new_lunch = ""
+        feedback_text = "Vote withdrawn."
+    else:
+        idx = int(selected_idx)
+        if idx < 0 or idx >= len(poll_choices):
+            return "Invalid option."
+        if prev_idx is not None and prev_idx == idx:
+            if not same_selection_withdraw:
+                return ""
+            del poll_state["votes"][user.id]
+            poll_state["counts"][idx] -= 1
+            action = "Cancelled vote"
+            new_choice_text = "CANCELLED"
+            new_lunch = ""
+            feedback_text = "Vote withdrawn."
+        elif prev_idx is not None:
+            poll_state["votes"][user.id] = idx
+            poll_state["counts"][prev_idx] -= 1
+            poll_state["counts"][idx] += 1
+            action = f"Changed vote: {poll_choices[prev_idx][0]} -> {poll_choices[idx][0]}"
+            new_choice_text, new_lunch = poll_choices[idx]
+            feedback_text = f"Vote updated: {new_choice_text}"
+        else:
+            poll_state["votes"][user.id] = idx
+            poll_state["counts"][idx] += 1
+            action = "Recorded vote"
+            new_choice_text, new_lunch = poll_choices[idx]
+            feedback_text = f"Vote recorded: {new_choice_text}"
+
+    username = user.username or ""
+    full_name = (user.full_name or "").strip()
+    username_link = f"https://t.me/{username}" if username else ""
+    handle = f"@{username}" if username else full_name
+    newcomer_value = classify_newcomer(MEMBER_INDEX, username, full_name)
+    gender_value = lookup_member_gender(MEMBER_INDEX, username)
+    row_date, row_time = now_utc8_date_time()
+
+    def _write():
+        append_row(
+            SHEETS,
+            poll_state["spreadsheet_id"],
+            "Votes!A:H",
+            [
+                row_date,
+                row_time,
+                str(user.id),
+                username,
+                full_name,
+                new_choice_text,
+                new_lunch,
+                action,
+            ],
+        )
+
+        upsert_name_result(
+            SHEETS,
+            poll_state["spreadsheet_id"],
+            poll_state,
+            user_id=user.id,
+            username_link=username_link,
+            full_name=full_name,
+            handle=handle,
+            status="Pulled out" if new_choice_text == "CANCELLED" else "Signed up",
+            selected_option=new_choice_text,
+            lunch=new_lunch,
+            gender=gender_value,
+            newcomer=newcomer_value,
+        )
+
+    await loop.run_in_executor(None, _write)
+    await loop.run_in_executor(
+        None,
+        lambda: update_tally(
+            SHEETS,
+            poll_state["spreadsheet_id"],
+            poll_state.get("choices", CHOICES),
+            poll_state.get("counts", [0, 0]),
+        ),
+    )
+    try:
+        await loop.run_in_executor(
+            None,
+            lambda: update_tracker_overview_aggregates(
+                SHEETS,
+                DRIVE,
+                poll_id=str(poll_id),
+                total_votes=len(poll_state.get("votes", {})),
+                option_vote_counts=list(poll_state.get("counts", [])),
+            ),
+        )
+    except Exception as e:
+        print("Tracker overview aggregate update failed:", e)
+    save_native_poll_states()
+
+    cap = int(poll_state.get("cap", 0) or 0)
+    if not poll_state.get("closed") and cap > 0 and len(poll_state["votes"]) >= cap:
+        closed = await _close_tracked_poll(
+            bot=context.bot,
+            poll_id=str(poll_id),
+            closed_by="auto_cap",
+            notice_text=f"Poll closed automatically (cap reached: {cap}).",
+        )
+        if closed:
+            feedback_text += f" Poll closed automatically (cap reached: {cap})."
+
+    return feedback_text
 
 
 def _extract_update_user_id(update: Update) -> Optional[int]:
@@ -2555,7 +2807,7 @@ def with_allowed_user_check(
 async def startall(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Ready.\n"
-        "Use /publishpoll to preview then send a native Telegram poll.\n"
+        "Use /publishpoll to preview then send an interactive Telegram vote message.\n"
         "Use /sample to get a copy-paste template for /publishpoll.\n"
         "Use /metadata to open the metadata spreadsheet.\n"
         "Use /pollstatus [poll_id ...] to check tracked/open/closed status.\n"
@@ -2567,7 +2819,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Ready.\n"
         "Use /sample to get a copy-paste template for publishpoll.\n"
-        "Use /publishpoll to preview then send a Telegram poll.\n"
+        "Use /publishpoll to preview then send an interactive Telegram vote message.\n"
         "Use /metadata to open the metadata spreadsheet.\n"
         "Use /pollstatus to check tracked/open/closed status for all polls.\n"
         "Use /stoppoll to select and close a poll\n"
@@ -2614,13 +2866,10 @@ async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not msg:
         return
 
-    native_items = []
-    for key, state in POLL_STATES.items():
-        if isinstance(key, tuple) and len(key) == 2 and key[0] == "native":
-            native_items.append((str(key[1]), state))
+    tracked_items = [(poll_id, state) for _, poll_id, state in _tracked_poll_items()]
 
-    if not native_items:
-        await msg.reply_text("No tracked native poll sheets found.")
+    if not tracked_items:
+        await msg.reply_text("No tracked poll sheets found.")
         return
 
     def _sort_key(item):
@@ -2631,10 +2880,10 @@ async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_id = 0
         return (message_id, poll_id)
 
-    native_items.sort(key=_sort_key, reverse=True)
+    tracked_items.sort(key=_sort_key, reverse=True)
 
     missing_title_ids = []
-    for _, state in native_items:
+    for _, state in tracked_items:
         if state.get("spreadsheet_title"):
             continue
         spreadsheet_id = str(state.get("spreadsheet_id", "") or "").strip()
@@ -2663,7 +2912,7 @@ async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
         fetched_titles = await loop.run_in_executor(None, lambda: _fetch_titles(missing_title_ids))
         if fetched_titles:
             updated = False
-            for _, state in native_items:
+            for _, state in tracked_items:
                 spreadsheet_id = str(state.get("spreadsheet_id", "") or "").strip()
                 title = fetched_titles.get(spreadsheet_id, "")
                 if title and not state.get("spreadsheet_title"):
@@ -2672,13 +2921,13 @@ async def activesheets(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if updated:
                 save_native_poll_states()
 
-    lines = [f"Tracked poll sheets: {len(native_items)}"]
+    lines = [f"Tracked poll sheets: {len(tracked_items)}"]
     if DRIVE_FOLDER_ID:
         folder_url = DRIVE_FOLDER_ID
         if not re.match(r"^https?://", folder_url, flags=re.IGNORECASE):
             folder_url = f"https://drive.google.com/drive/folders/{folder_url}"
         lines.append(f"Drive folder: {folder_url}")
-    for poll_id, state in native_items:
+    for poll_id, state in tracked_items:
         choices = list(state.get("choices") or CHOICES)
         counts = list(state.get("counts") or [])
         votes = state.get("votes") or {}
@@ -2742,7 +2991,7 @@ async def forgetpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(
             "Usage: /forgetpoll <poll_id>\n"
             "Tip: use /activesheets to copy a poll_id.\n"
-            "This removes local tracking only (does not delete the Telegram poll or Google Sheet)."
+            "This removes local tracking only (does not delete the Telegram vote message or Google Sheet)."
         )
         return
 
@@ -2754,16 +3003,7 @@ async def forgetpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Invalid poll_id. Use /activesheets to copy a valid one.")
         return
 
-    matched_key = None
-    matched_state = None
-    for key, state in POLL_STATES.items():
-        if not (isinstance(key, tuple) and len(key) == 2 and key[0] == "native"):
-            continue
-        if str(key[1]) == poll_id:
-            matched_key = key
-            matched_state = state
-            break
-
+    matched_key, matched_state = _find_tracked_poll(poll_id)
     if matched_key is None:
         await msg.reply_text(f"Tracked poll not found: {poll_id}")
         return
@@ -2778,7 +3018,7 @@ async def forgetpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     reply = [
         f"Removed tracking for poll_id={poll_id}.",
-        "Telegram poll and Google Sheet were not deleted.",
+        "Telegram vote message and Google Sheet were not deleted.",
     ]
     if spreadsheet_url:
         reply.append(spreadsheet_url)
@@ -2802,12 +3042,8 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     raw_arg = extract_command_body(msg.text or "", "pollstatus").strip()
 
-    native_items = []
-    for key, state in POLL_STATES.items():
-        if isinstance(key, tuple) and len(key) == 2 and key[0] == "native":
-            native_items.append((str(key[1]), state))
-
-    tracked_map = {poll_id: state for poll_id, state in native_items}
+    tracked_items = [(poll_id, state) for _, poll_id, state in _tracked_poll_items()]
+    tracked_map = {poll_id: state for poll_id, state in tracked_items}
 
     # Per-poll lookup mode: /pollstatus <poll_id> [poll_id...]
     if raw_arg:
@@ -2871,7 +3107,7 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Summary mode: /pollstatus
     open_ids = []
     closed_ids = []
-    for poll_id, state in native_items:
+    for poll_id, state in tracked_items:
         if isinstance(state, dict) and state.get("closed"):
             closed_ids.append(poll_id)
         else:
@@ -2905,9 +3141,9 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
             poll_title = str(state.get("poll_title", "") or "").strip()
             lines.append(f"  title={poll_title}")
 
-    if not native_items:
+    if not tracked_items:
         lines.append("")
-        lines.append("No tracked native polls found.")
+        lines.append("No tracked polls found.")
 
     text = "\n".join(lines)
     if len(text) <= 4000:
@@ -2929,17 +3165,17 @@ async def pollstatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("\n".join(chunk_lines))
 
 
-async def _close_tracked_native_poll(
+async def _close_tracked_poll(
     *,
     bot,
     poll_id: str,
     closed_by: str,
     notice_text: str = "",
 ) -> bool:
-    poll_key = ("native", str(poll_id or "").strip())
-    poll_state = POLL_STATES.get(poll_key)
-    if not isinstance(poll_state, dict):
+    matched_key, poll_state = _find_tracked_poll(str(poll_id or "").strip())
+    if matched_key is None or not isinstance(poll_state, dict):
         return False
+    poll_kind = str(matched_key[0])
     if poll_state.get("closed"):
         _cancel_scheduled_poll_close(str(poll_id))
         return False
@@ -2950,15 +3186,41 @@ async def _close_tracked_native_poll(
         message_id = int(message_id_raw)
     except (TypeError, ValueError):
         message_id = None
-    if not chat_id or message_id is None:
-        print("Native poll close skipped due to missing chat/message id:", poll_id)
-        return False
+    if poll_kind == "native":
+        if not chat_id or message_id is None:
+            print("Native poll close skipped due to missing chat/message id:", poll_id)
+            return False
 
-    try:
-        await bot.stop_poll(chat_id=chat_id, message_id=message_id)
-    except Exception as e:
-        print("Native poll close failed for", poll_id, ":", e)
-        return False
+        try:
+            await bot.stop_poll(chat_id=chat_id, message_id=message_id)
+        except Exception as e:
+            print("Native poll close failed for", poll_id, ":", e)
+            return False
+    else:
+        if chat_id and message_id is not None:
+            parse_mode = str(poll_state.get("message_parse_mode", "") or "").strip() or None
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=closed_tracked_poll_message(
+                        str(poll_state.get("message_text", "") or ""),
+                        parse_mode,
+                    ),
+                    parse_mode=parse_mode,
+                    reply_markup=None,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                print("Inline poll close edit failed for", poll_id, ":", e)
+                try:
+                    await bot.edit_message_reply_markup(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        reply_markup=None,
+                    )
+                except Exception as inner:
+                    print("Inline poll keyboard clear failed for", poll_id, ":", inner)
 
     poll_state["closed"] = True
     _cancel_scheduled_poll_close(str(poll_id))
@@ -2998,10 +3260,11 @@ async def _close_tracked_native_poll(
         print("Tracker overview status update failed for auto-close:", e)
 
     if notice_text:
-        try:
-            await bot.send_message(chat_id=chat_id, text=notice_text)
-        except Exception as e:
-            print("Native poll auto-close notice failed:", e)
+        if chat_id:
+            try:
+                await bot.send_message(chat_id=chat_id, text=notice_text)
+            except Exception as e:
+                print("Tracked poll close notice failed:", e)
     return True
 
 
@@ -3011,18 +3274,10 @@ async def _stop_tracked_poll_and_remove(
     *,
     closed_by: str = "",
 ) -> str:
-    matched_key = None
-    matched_state = None
-    for key, state in POLL_STATES.items():
-        if not (isinstance(key, tuple) and len(key) == 2 and key[0] == "native"):
-            continue
-        if str(key[1]) == poll_id:
-            matched_key = key
-            matched_state = state
-            break
-
+    matched_key, matched_state = _find_tracked_poll(poll_id)
     if matched_key is None or not isinstance(matched_state, dict):
         raise ValueError(f"Tracked poll not found: {poll_id}")
+    poll_kind = str(matched_key[0])
 
     was_closed = bool(matched_state.get("closed"))
 
@@ -3033,16 +3288,40 @@ async def _stop_tracked_poll_and_remove(
     except (TypeError, ValueError):
         message_id = None
 
-    if not chat_id or message_id is None:
-        raise ValueError(
-            f"Cannot stop poll_id={poll_id}: missing tracked Telegram message id/chat id."
-        )
-
     if not was_closed:
-        try:
-            await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
-        except Exception as e:
-            raise RuntimeError(f"Failed to stop poll_id={poll_id}: {e}") from e
+        if poll_kind == "native":
+            if not chat_id or message_id is None:
+                raise ValueError(
+                    f"Cannot stop poll_id={poll_id}: missing tracked Telegram message id/chat id."
+                )
+            try:
+                await context.bot.stop_poll(chat_id=chat_id, message_id=message_id)
+            except Exception as e:
+                raise RuntimeError(f"Failed to stop poll_id={poll_id}: {e}") from e
+        elif chat_id and message_id is not None:
+            parse_mode = str(matched_state.get("message_parse_mode", "") or "").strip() or None
+            try:
+                await context.bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=closed_tracked_poll_message(
+                        str(matched_state.get("message_text", "") or ""),
+                        parse_mode,
+                    ),
+                    parse_mode=parse_mode,
+                    reply_markup=None,
+                    disable_web_page_preview=True,
+                )
+            except Exception as e:
+                print("Inline poll stop edit failed for", poll_id, ":", e)
+                try:
+                    await context.bot.edit_message_reply_markup(
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        reply_markup=None,
+                    )
+                except Exception as inner:
+                    print("Inline poll keyboard clear failed for stoppoll:", inner)
         matched_state["closed"] = True
 
     spreadsheet_id = str(matched_state.get("spreadsheet_id", "") or "")
@@ -3135,13 +3414,10 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     raw_arg = extract_command_body(msg.text or "", "stoppoll").strip()
     if not raw_arg:
-        native_items = []
-        for key, state in POLL_STATES.items():
-            if isinstance(key, tuple) and len(key) == 2 and key[0] == "native":
-                native_items.append((str(key[1]), state))
+        tracked_items = [(poll_id, state) for _, poll_id, state in _tracked_poll_items()]
 
-        if not native_items:
-            await msg.reply_text("No tracked native polls found.")
+        if not tracked_items:
+            await msg.reply_text("No tracked polls found.")
             return
 
         def _sort_key(item):
@@ -3152,12 +3428,12 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 message_id = 0
             return (message_id, poll_id)
 
-        native_items.sort(key=_sort_key, reverse=True)
+        tracked_items.sort(key=_sort_key, reverse=True)
 
         _prune_pending_stoppoll_pickers()
         token = uuid.uuid4().hex
         PENDING_STOPPOLL_PICKERS[token] = {
-            "poll_ids": [poll_id for poll_id, _ in native_items],
+            "poll_ids": [poll_id for poll_id, _ in tracked_items],
             "chat_id": str(msg.chat_id),
             "user_id": str(msg.from_user.id) if msg.from_user else "",
             "created_ts": time.time(),
@@ -3165,7 +3441,7 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await msg.reply_text(
             "Select a poll to stop (you will be asked to confirm next):",
-            reply_markup=stoppoll_picker_keyboard(token, native_items),
+            reply_markup=stoppoll_picker_keyboard(token, tracked_items),
         )
         return
 
@@ -3177,16 +3453,7 @@ async def stoppoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("Invalid poll_id. Use /pollstatus to copy a valid one.")
         return
 
-    matched_key = None
-    matched_state = None
-    for key, state in POLL_STATES.items():
-        if not (isinstance(key, tuple) and len(key) == 2 and key[0] == "native"):
-            continue
-        if str(key[1]) == poll_id:
-            matched_key = key
-            matched_state = state
-            break
-
+    matched_key, matched_state = _find_tracked_poll(poll_id)
     if matched_key is None or not isinstance(matched_state, dict):
         await msg.reply_text(f"Tracked poll not found: {poll_id}")
         return
@@ -3245,7 +3512,7 @@ async def publishpoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
         preview_lines.append(f"Cap: {poll_cap}")
     if poll_close_at:
         preview_lines.append(f"Closes at (UTC+8): {poll_close_at}")
-    preview_lines.extend(["", "Publish this poll?"])
+    preview_lines.extend(["", "Publish this vote message?"])
 
     _prune_pending_publish_previews()
     token = uuid.uuid4().hex
@@ -3310,7 +3577,7 @@ async def on_publishpoll_preview_action(update: Update, context: ContextTypes.DE
         return
 
     try:
-        await _send_native_poll_and_track(
+        await _send_tracked_poll_message_and_track(
             context,
             chat_id=query.message.chat_id,
             raw_body=str(pending.get("raw_body", "")),
@@ -3447,11 +3714,7 @@ async def on_stoppoll_picker_action(update: Update, context: ContextTypes.DEFAUL
         await query.answer("Selection invalid. Run /stoppoll again.", show_alert=True)
         return
 
-    matched_state = None
-    for key, state in POLL_STATES.items():
-        if isinstance(key, tuple) and len(key) == 2 and key[0] == "native" and str(key[1]) == poll_id:
-            matched_state = state
-            break
+    _, matched_state = _find_tracked_poll(poll_id)
     if not isinstance(matched_state, dict):
         await query.answer("Poll no longer tracked. Run /stoppoll again.", show_alert=True)
         return
@@ -3485,141 +3748,60 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
         print("Native poll answer received for untracked poll:", answer.poll_id)
         return
 
-    loop = asyncio.get_running_loop()
-
-    global MEMBER_INDEX, MEMBER_INDEX_LAST_REFRESH_TS
-    if MEMBER_RAW_SOURCE or MEMBER_CHECK_SOURCE:
-        now = time.time()
-        refresh_due = (
-            MEMBER_INDEX_LAST_REFRESH_TS <= 0
-            or MEMBER_CHECK_REFRESH_SECONDS <= 0
-            or (now - MEMBER_INDEX_LAST_REFRESH_TS) >= MEMBER_CHECK_REFRESH_SECONDS
-        )
-        if refresh_due:
-            try:
-                if MEMBER_RAW_SOURCE:
-                    MEMBER_INDEX = await loop.run_in_executor(
-                        None,
-                        lambda: load_member_check_index_from_raw_source(SHEETS, MEMBER_RAW_SOURCE),
-                    )
-                else:
-                    MEMBER_INDEX = await loop.run_in_executor(
-                        None,
-                        lambda: load_member_check_index_from_sheet(SHEETS, MEMBER_CHECK_SOURCE, MEMBER_CHECK_TAB),
-                    )
-                MEMBER_INDEX_LAST_REFRESH_TS = time.time()
-            except Exception as e:
-                print("Member check live refresh failed:", e)
-
-    poll_choices = poll_state.get("choices", list(CHOICES))
-    user = answer.user
-    prev_idx = poll_state["votes"].get(user.id)
     option_ids = list(answer.option_ids or [])
-
-    # Vote removed / retracted
-    if not option_ids:
-        if prev_idx is None:
-            return
-        del poll_state["votes"][user.id]
-        poll_state["counts"][prev_idx] -= 1
-        action = "Cancelled vote"
-        new_choice_text = "CANCELLED"
-        new_lunch = ""
-
-    else:
-        idx = option_ids[0]
-        if idx < 0 or idx >= len(poll_choices):
-            return
-
-        # Same answer event (usually no-op for Telegram, but guard anyway)
-        if prev_idx is not None and prev_idx == idx:
-            return
-
-        if prev_idx is not None:
-            poll_state["votes"][user.id] = idx
-            poll_state["counts"][prev_idx] -= 1
-            poll_state["counts"][idx] += 1
-            action = f"Changed vote: {poll_choices[prev_idx][0]} -> {poll_choices[idx][0]}"
-        else:
-            poll_state["votes"][user.id] = idx
-            poll_state["counts"][idx] += 1
-            action = "Recorded vote"
-
-        new_choice_text, new_lunch = poll_choices[idx]
-
-    username = user.username or ""
-    full_name = (user.full_name or "").strip()
-    username_link = f"https://t.me/{username}" if username else ""
-    handle = f"@{username}" if username else full_name
-    newcomer_value = classify_newcomer(MEMBER_INDEX, username, full_name)
-    gender_value = lookup_member_gender(MEMBER_INDEX, username)
-    row_date, row_time = now_utc8_date_time()
-
-    def _write():
-        append_row(
-            SHEETS,
-            poll_state["spreadsheet_id"],
-            "Votes!A:H",
-            [
-                row_date,
-                row_time,
-                str(user.id),
-                username,
-                full_name,
-                new_choice_text,
-                new_lunch,
-                action,
-            ],
-        )
-
-        upsert_name_result(
-            SHEETS,
-            poll_state["spreadsheet_id"],
-            poll_state,
-            user_id=user.id,
-            username_link=username_link,
-            full_name=full_name,
-            handle=handle,
-            status="Pulled out" if new_choice_text == "CANCELLED" else "Signed up",
-            selected_option=new_choice_text,
-            lunch=new_lunch,
-            gender=gender_value,
-            newcomer=newcomer_value,
-        )
-
-    await loop.run_in_executor(None, _write)
-    await loop.run_in_executor(
-        None,
-        lambda: update_tally(
-            SHEETS,
-            poll_state["spreadsheet_id"],
-            poll_state.get("choices", CHOICES),
-            poll_state.get("counts", [0, 0]),
-        ),
+    selected_idx = option_ids[0] if option_ids else None
+    await _apply_vote_selection(
+        context,
+        poll_id=str(answer.poll_id),
+        poll_state=poll_state,
+        user=answer.user,
+        selected_idx=selected_idx,
+        same_selection_withdraw=False,
     )
-    try:
-        await loop.run_in_executor(
-            None,
-            lambda: update_tracker_overview_aggregates(
-                SHEETS,
-                DRIVE,
-                poll_id=str(answer.poll_id),
-                total_votes=len(poll_state.get("votes", {})),
-                option_vote_counts=list(poll_state.get("counts", [])),
-            ),
-        )
-    except Exception as e:
-        print("Tracker overview aggregate update failed:", e)
-    save_native_poll_states()
 
-    cap = int(poll_state.get("cap", 0) or 0)
-    if not poll_state.get("closed") and cap > 0 and len(poll_state["votes"]) >= cap:
-        await _close_tracked_native_poll(
-            bot=context.bot,
-            poll_id=str(answer.poll_id),
-            closed_by="auto_cap",
-            notice_text=f"Poll closed automatically (cap reached: {cap}).",
-        )
+
+async def on_inline_poll_vote_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+
+    parts = (query.data or "").split("|")
+    if len(parts) != 3 or parts[0] != "pv":
+        await query.answer()
+        return
+
+    _, poll_id, action = parts
+    poll_key = ("inline", str(poll_id or "").strip())
+    poll_state = POLL_STATES.get(poll_key)
+    if not isinstance(poll_state, dict):
+        await query.answer("Poll is no longer tracked.", show_alert=True)
+        return
+    if poll_state.get("closed"):
+        await query.answer("Voting is closed.", show_alert=True)
+        return
+    if not query.from_user:
+        await query.answer()
+        return
+
+    try:
+        selected_idx = int(action)
+    except (TypeError, ValueError):
+        await query.answer("Invalid option.", show_alert=True)
+        return
+
+    feedback_text = await _apply_vote_selection(
+        context,
+        poll_id=str(poll_id),
+        poll_state=poll_state,
+        user=query.from_user,
+        selected_idx=selected_idx,
+        same_selection_withdraw=True,
+    )
+    await _refresh_inline_poll_message(context.bot, str(poll_id), poll_state)
+    answer_text = feedback_text or "Vote updated."
+    if len(answer_text) > 180:
+        answer_text = answer_text[:177].rstrip() + "..."
+    await query.answer(answer_text)
 
 
 def initialize_runtime_services():
@@ -3637,7 +3819,7 @@ def initialize_runtime_services():
 
     restored_native = load_native_poll_states()
     if restored_native:
-        print("Restored native poll trackers:", restored_native, "from", NATIVE_POLL_STATE_FILE)
+        print("Restored tracked polls:", restored_native, "from", NATIVE_POLL_STATE_FILE)
 
     if MEMBER_RAW_SOURCE:
         try:
@@ -3685,9 +3867,7 @@ def initialize_runtime_services():
 
 
 async def _on_telegram_app_post_init(telegram_app: Application) -> None:
-    for key, state in list(POLL_STATES.items()):
-        if not (isinstance(key, tuple) and len(key) == 2 and key[0] == "native"):
-            continue
+    for key, state in list(_iter_tracked_poll_states()):
         poll_id = str(key[1])
         _ensure_poll_close_schedule_for_state(telegram_app, poll_id, state)
 
@@ -3707,6 +3887,9 @@ def build_telegram_application() -> Application:
     telegram_app.add_handler(CommandHandler("stoppoll", with_allowed_user_check(stoppoll)))
     telegram_app.add_handler(CommandHandler("publishpoll", with_allowed_user_check(publishpoll)))
     telegram_app.add_handler(PollAnswerHandler(with_allowed_user_check(on_native_poll_answer)))
+    telegram_app.add_handler(
+        CallbackQueryHandler(with_allowed_user_check(on_inline_poll_vote_action), pattern=r"^pv\|")
+    )
     telegram_app.add_handler(
         CallbackQueryHandler(with_allowed_user_check(on_publishpoll_preview_action), pattern=r"^ppc\|")
     )
