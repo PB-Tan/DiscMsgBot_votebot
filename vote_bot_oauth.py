@@ -210,6 +210,7 @@ PUBLISHPOLL_SAMPLE_GUIDE = (
     "- lunch1..lunch4 are optional lunch flags per option.\n"
     "- lunch1 (No) and lunch2 (Yes) are the default values if not provided.\n\n"
     "- channel / publish_to / target_chat is optional; use @channelusername or a numeric chat id to publish directly into another chat/channel.\n"
+    "- use @testdaywavotebot channel for testing purposes"
     f"- DEFAULT_PUBLISH_CHAT={DEFAULT_PUBLISH_CHAT or '<not set>'} is used when no target is provided.\n\n"
     "Minimal template:\n"
     f"{PUBLISHPOLL_MINIMAL_TEMPLATE}"
