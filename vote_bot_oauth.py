@@ -158,7 +158,7 @@ TRACKER_OVERVIEW_HEADERS = [
 
 PUBLISHPOLL_SAMPLE_TEMPLATE = (
     "/publishpoll\n"
-    "channel=@yourchannel\n"
+    "channel=@daywasg\n"
     "title=<Enter event title here>\n"
     "date=31-Dec-2099\n"
     "close_at=31-Dec-2099 23:59\n"
@@ -173,14 +173,14 @@ PUBLISHPOLL_SAMPLE_TEMPLATE = (
 
 PUBLISHPOLL_MINIMAL_TEMPLATE = (
     "/publishpoll\n"
-    "channel=@yourchannel\n"
+    "channel=@ydaywasg\n"
     "title=<Enter event title here>\n"
     "date=31-Dec-2099\n\n"
 )
 
 PUBLISHPOLL_SITS_TEMPLATE = (
     "/publishpoll\n"
-    "channel=@yourchannel\n"
+    "channel=@daywasg\n"
     "title=DAYWA guided meditation session\n"
     "Description = Join us for online 30 mins guided meditation! Indicate your availability by closing date and time, or when slots are filled!\n"
     "Venue = Zoom\n"
@@ -215,7 +215,7 @@ PUBLISHPOLL_SAMPLE_GUIDE = (
     f"{PUBLISHPOLL_MINIMAL_TEMPLATE}"
     "Sits template:\n"
     f"{PUBLISHPOLL_SITS_TEMPLATE}"
-    "Full template:\n"
+    "Disc template:\n"
     f"{PUBLISHPOLL_SAMPLE_TEMPLATE}"
 )
 
@@ -2377,6 +2377,16 @@ def build_poll_prompt(query_text: str) -> tuple[str, Optional[str]]:
         "lunch 3": "lunch3",
         "lunch4": "lunch4",
         "lunch 4": "lunch4",
+        "channel": "target_chat",
+        "target_chat": "target_chat",
+        "target chat": "target_chat",
+        "publish_to": "target_chat",
+        "publish to": "target_chat",
+        "post_to": "target_chat",
+        "post to": "target_chat",
+        "chat": "target_chat",
+        "chat_id": "target_chat",
+        "chat id": "target_chat",
     }
     fields: dict[str, str] = {}
     free_lines: list[str] = []
