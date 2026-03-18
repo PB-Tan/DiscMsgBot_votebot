@@ -1796,6 +1796,8 @@ PENDING_PUBLISH_PREVIEWS = {}  # token -> {raw_body, chat_id, user_id, created_t
 PENDING_STOPPOLL_CONFIRMATIONS = {}  # token -> {poll_id, chat_id, user_id, created_ts}
 PENDING_STOPPOLL_PICKERS = {}  # token -> {poll_ids, chat_id, user_id, created_ts}
 SCHEDULED_POLL_CLOSE_TASKS: dict[str, asyncio.Task[Any]] = {}
+POLL_PERSIST_LOCKS: dict[str, asyncio.Lock] = {}
+BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
 MEMBER_INDEX = {"enabled": False, "source": "", "handles": set(), "names": {}}
 MEMBER_INDEX_LAST_REFRESH_TS = 0.0
 SHEETS = None
@@ -1826,6 +1828,31 @@ def _find_tracked_poll(poll_id: str) -> tuple[Optional[tuple[str, Any]], Optiona
         if str(key[1]) == wanted:
             return key, state
     return None, None
+
+
+def _get_poll_persist_lock(poll_id: str) -> asyncio.Lock:
+    token = str(poll_id or "").strip()
+    lock = POLL_PERSIST_LOCKS.get(token)
+    if lock is None:
+        lock = asyncio.Lock()
+        POLL_PERSIST_LOCKS[token] = lock
+    return lock
+
+
+def _spawn_background_task(coro: Awaitable[Any], *, name: str) -> None:
+    task = asyncio.create_task(coro, name=name)
+    BACKGROUND_TASKS.add(task)
+
+    def _done_callback(done_task: asyncio.Task[Any]) -> None:
+        BACKGROUND_TASKS.discard(done_task)
+        try:
+            done_task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"Background task failed ({name}):", e)
+
+    task.add_done_callback(_done_callback)
 
 
 def _prune_pending_publish_previews() -> None:
@@ -1981,6 +2008,7 @@ def _serialize_poll_state(state: dict) -> dict:
         "spreadsheet_title": str(state.get("spreadsheet_title", "")),
         "message_text": str(state.get("message_text", "")),
         "message_parse_mode": str(state.get("message_parse_mode", "")),
+        "notification_chat_id": str(state.get("notification_chat_id", "")),
         "choices": [[str(label), str(lunch)] for label, lunch in choices],
         "votes": {str(k): int(v) for k, v in state.get("votes", {}).items()},
         "counts": counts,
@@ -2058,6 +2086,7 @@ def _deserialize_poll_state(raw: dict) -> Optional[dict]:
         "spreadsheet_title": spreadsheet_title,
         "message_text": str(raw.get("message_text", "")),
         "message_parse_mode": str(raw.get("message_parse_mode", "")),
+        "notification_chat_id": str(raw.get("notification_chat_id", "")),
         "choices": choices,
         "votes": votes,
         "counts": counts,
@@ -2162,6 +2191,7 @@ def create_poll_state(
         "spreadsheet_title": spreadsheet_title,
         "message_text": "",
         "message_parse_mode": "",
+        "notification_chat_id": "",
         "choices": poll_choices,
         "votes": {},               # user_id -> choice_idx
         "counts": [0] * len(poll_choices),
@@ -2619,6 +2649,7 @@ async def _send_tracked_poll_message_and_track(
 
     poll_state["chat_id"] = str(poll_msg.chat_id)
     poll_state["message_id"] = str(poll_msg.message_id)
+    poll_state["notification_chat_id"] = str(confirmation_chat_id)
     POLL_STATES[poll_key] = poll_state
     save_native_poll_states()
     if normalized_close_at:
@@ -2697,24 +2728,20 @@ async def _refresh_inline_poll_message(
             print("Inline poll message refresh failed for", poll_id, ":", e)
 
 
-async def _apply_vote_selection(
-    context: ContextTypes.DEFAULT_TYPE,
+def _apply_vote_selection_to_state(
     *,
     poll_id: str,
     poll_state: dict,
     user,
     selected_idx: Optional[int],
     same_selection_withdraw: bool,
-) -> str:
-    loop = asyncio.get_running_loop()
-    await _refresh_member_index_if_due(loop)
-
+) -> dict[str, Any]:
     poll_choices = poll_state.get("choices", list(CHOICES))
     prev_idx = poll_state["votes"].get(user.id)
 
     if selected_idx is None:
         if prev_idx is None:
-            return "You do not have an active vote."
+            return {"feedback_text": "You do not have an active vote.", "should_persist": False}
         del poll_state["votes"][user.id]
         poll_state["counts"][prev_idx] -= 1
         action = "Cancelled vote"
@@ -2724,10 +2751,10 @@ async def _apply_vote_selection(
     else:
         idx = int(selected_idx)
         if idx < 0 or idx >= len(poll_choices):
-            return "Invalid option."
+            return {"feedback_text": "Invalid option.", "should_persist": False}
         if prev_idx is not None and prev_idx == idx:
             if not same_selection_withdraw:
-                return ""
+                return {"feedback_text": "", "should_persist": False}
             del poll_state["votes"][user.id]
             poll_state["counts"][idx] -= 1
             action = "Cancelled vote"
@@ -2752,79 +2779,111 @@ async def _apply_vote_selection(
     full_name = (user.full_name or "").strip()
     username_link = f"https://t.me/{username}" if username else ""
     handle = f"@{username}" if username else full_name
-    newcomer_value = classify_newcomer(MEMBER_INDEX, username, full_name)
-    gender_value = lookup_member_gender(MEMBER_INDEX, username)
     row_date, row_time = now_utc8_date_time()
+    return {
+        "feedback_text": feedback_text,
+        "should_persist": True,
+        "action": action,
+        "new_choice_text": new_choice_text,
+        "new_lunch": new_lunch,
+        "row_date": row_date,
+        "row_time": row_time,
+        "user_id": user.id,
+        "username": username,
+        "full_name": full_name,
+        "username_link": username_link,
+        "handle": handle,
+        "poll_id": str(poll_id),
+    }
 
-    def _write():
-        append_row(
-            SHEETS,
-            poll_state["spreadsheet_id"],
-            "Votes!A:H",
-            [
-                row_date,
-                row_time,
-                str(user.id),
-                username,
-                full_name,
-                new_choice_text,
-                new_lunch,
-                action,
-            ],
+
+async def _persist_vote_selection(
+    context: ContextTypes.DEFAULT_TYPE,
+    *,
+    poll_id: str,
+    poll_state: dict,
+    vote_result: dict[str, Any],
+    refresh_message: bool,
+) -> None:
+    lock = _get_poll_persist_lock(poll_id)
+    async with lock:
+        if refresh_message:
+            await _refresh_inline_poll_message(context.bot, str(poll_id), poll_state)
+
+        loop = asyncio.get_running_loop()
+        await _refresh_member_index_if_due(loop)
+        newcomer_value = classify_newcomer(
+            MEMBER_INDEX,
+            str(vote_result.get("username", "")),
+            str(vote_result.get("full_name", "")),
         )
+        gender_value = lookup_member_gender(MEMBER_INDEX, str(vote_result.get("username", "")))
 
-        upsert_name_result(
-            SHEETS,
-            poll_state["spreadsheet_id"],
-            poll_state,
-            user_id=user.id,
-            username_link=username_link,
-            full_name=full_name,
-            handle=handle,
-            status="Pulled out" if new_choice_text == "CANCELLED" else "Signed up",
-            selected_option=new_choice_text,
-            lunch=new_lunch,
-            gender=gender_value,
-            newcomer=newcomer_value,
-        )
+        def _write():
+            append_row(
+                SHEETS,
+                poll_state["spreadsheet_id"],
+                "Votes!A:H",
+                [
+                    str(vote_result.get("row_date", "")),
+                    str(vote_result.get("row_time", "")),
+                    str(vote_result.get("user_id", "")),
+                    str(vote_result.get("username", "")),
+                    str(vote_result.get("full_name", "")),
+                    str(vote_result.get("new_choice_text", "")),
+                    str(vote_result.get("new_lunch", "")),
+                    str(vote_result.get("action", "")),
+                ],
+            )
 
-    await loop.run_in_executor(None, _write)
-    await loop.run_in_executor(
-        None,
-        lambda: update_tally(
-            SHEETS,
-            poll_state["spreadsheet_id"],
-            poll_state.get("choices", CHOICES),
-            poll_state.get("counts", [0, 0]),
-        ),
-    )
-    try:
+            upsert_name_result(
+                SHEETS,
+                poll_state["spreadsheet_id"],
+                poll_state,
+                user_id=int(vote_result.get("user_id", 0)),
+                username_link=str(vote_result.get("username_link", "")),
+                full_name=str(vote_result.get("full_name", "")),
+                handle=str(vote_result.get("handle", "")),
+                status="Pulled out" if str(vote_result.get("new_choice_text", "")) == "CANCELLED" else "Signed up",
+                selected_option=str(vote_result.get("new_choice_text", "")),
+                lunch=str(vote_result.get("new_lunch", "")),
+                gender=gender_value,
+                newcomer=newcomer_value,
+            )
+
+        await loop.run_in_executor(None, _write)
         await loop.run_in_executor(
             None,
-            lambda: update_tracker_overview_aggregates(
+            lambda: update_tally(
                 SHEETS,
-                DRIVE,
-                poll_id=str(poll_id),
-                total_votes=len(poll_state.get("votes", {})),
-                option_vote_counts=list(poll_state.get("counts", [])),
+                poll_state["spreadsheet_id"],
+                poll_state.get("choices", CHOICES),
+                poll_state.get("counts", [0, 0]),
             ),
         )
-    except Exception as e:
-        print("Tracker overview aggregate update failed:", e)
-    save_native_poll_states()
+        try:
+            await loop.run_in_executor(
+                None,
+                lambda: update_tracker_overview_aggregates(
+                    SHEETS,
+                    DRIVE,
+                    poll_id=str(poll_id),
+                    total_votes=len(poll_state.get("votes", {})),
+                    option_vote_counts=list(poll_state.get("counts", [])),
+                ),
+            )
+        except Exception as e:
+            print("Tracker overview aggregate update failed:", e)
+        save_native_poll_states()
 
-    cap = int(poll_state.get("cap", 0) or 0)
-    if not poll_state.get("closed") and cap > 0 and len(poll_state["votes"]) >= cap:
-        closed = await _close_tracked_poll(
-            bot=context.bot,
-            poll_id=str(poll_id),
-            closed_by="auto_cap",
-            notice_text=f"Poll closed automatically (cap reached: {cap}).",
-        )
-        if closed:
-            feedback_text += f" Poll closed automatically (cap reached: {cap})."
-
-    return feedback_text
+        cap = int(poll_state.get("cap", 0) or 0)
+        if not poll_state.get("closed") and cap > 0 and len(poll_state["votes"]) >= cap:
+            await _close_tracked_poll(
+                bot=context.bot,
+                poll_id=str(poll_id),
+                closed_by="auto_cap",
+                notice_text=f"Poll closed automatically (cap reached: {cap}).",
+            )
 
 
 def _extract_update_user_id(update: Update) -> Optional[int]:
@@ -3338,9 +3397,10 @@ async def _close_tracked_poll(
         print("Tracker overview status update failed for auto-close:", e)
 
     if notice_text:
-        if chat_id:
+        notice_chat_id = str(poll_state.get("notification_chat_id", "") or "").strip() or str(chat_id or "").strip()
+        if notice_chat_id:
             try:
-                await bot.send_message(chat_id=chat_id, text=notice_text)
+                await bot.send_message(chat_id=notice_chat_id, text=notice_text)
             except Exception as e:
                 print("Tracked poll close notice failed:", e)
     return True
@@ -3839,13 +3899,21 @@ async def on_native_poll_answer(update: Update, context: ContextTypes.DEFAULT_TY
 
     option_ids = list(answer.option_ids or [])
     selected_idx = option_ids[0] if option_ids else None
-    await _apply_vote_selection(
-        context,
+    vote_result = _apply_vote_selection_to_state(
         poll_id=str(answer.poll_id),
         poll_state=poll_state,
         user=answer.user,
         selected_idx=selected_idx,
         same_selection_withdraw=False,
+    )
+    if not vote_result.get("should_persist"):
+        return
+    await _persist_vote_selection(
+        context,
+        poll_id=str(answer.poll_id),
+        poll_state=poll_state,
+        vote_result=vote_result,
+        refresh_message=False,
     )
 
 
@@ -3878,15 +3946,25 @@ async def on_inline_poll_vote_action(update: Update, context: ContextTypes.DEFAU
         await query.answer("Invalid option.", show_alert=True)
         return
 
-    feedback_text = await _apply_vote_selection(
-        context,
+    vote_result = _apply_vote_selection_to_state(
         poll_id=str(poll_id),
         poll_state=poll_state,
         user=query.from_user,
         selected_idx=selected_idx,
         same_selection_withdraw=True,
     )
-    await _refresh_inline_poll_message(context.bot, str(poll_id), poll_state)
+    feedback_text = str(vote_result.get("feedback_text", "") or "")
+    if vote_result.get("should_persist"):
+        _spawn_background_task(
+            _persist_vote_selection(
+                context,
+                poll_id=str(poll_id),
+                poll_state=poll_state,
+                vote_result=vote_result,
+                refresh_message=True,
+            ),
+            name=f"persist-inline-vote-{poll_id}",
+        )
     answer_text = feedback_text or "Vote updated."
     if len(answer_text) > 180:
         answer_text = answer_text[:177].rstrip() + "..."
