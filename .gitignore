@@ -1,13 +1,21 @@
 __pycache__/**
-__pycache__/vote_bot_oauth.cpython-313.pyc
-token.json
+*.pyc
+
+# Local OAuth credentials/tokens
 oauth_client.json
-__pycache__/vote_bot_oauth.cpython-313.pyc
-oauth_client.json
 token.json
-test-discmsgbot-7742f7d11711.json
+test-discmsgbot*.json
+
+# Local runtime state and recovery journals
+tracked_poll_states.json
+tracked_poll_states.json.tmp
+pending_vote_events.jsonl
+pending_vote_events.jsonl.tmp
+native_poll_states.json
+
+# Local test helpers
 test_gsheet.py
 test_oauth_create_sheet.py
-test-discmsgbot*.json
-native_poll_states.json
+
+# Local porting notes
 GOOGLE_APPS_SCRIPT_PORTING_SUMMARY.md

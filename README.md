@@ -141,15 +141,49 @@ Then in Telegram:
 ### 5. Optional Render Settings (Recommended)
 
 - `PYTHON_VERSION`: pin a Python version if you want reproducible builds (for example `3.11.x`)
-- Persistent Disk: useful if you want local files to survive restarts (see below)
+- Persistent Disk: recommended for live polls so accepted votes and active poll state survive restarts/redeploys
 
-Why a persistent disk may help:
-- `native_poll_states.json` stores native poll tracking state locally
-- file-based `OAUTH_TOKEN_JSON` can be refreshed/persisted to disk
+Recommended disk settings:
+
+```text
+Mount path: /var/data
+Size: 1 GB
+```
+
+Recommended environment variables when a disk is attached:
+
+```bash
+TRACKED_POLL_STATE_FILE=/var/data/tracked_poll_states.json
+PENDING_VOTE_EVENTS_FILE=/var/data/pending_vote_events.jsonl
+```
+
+Why a persistent disk helps:
+- `tracked_poll_states.json` stores active poll tracking state locally
+- `pending_vote_events.jsonl` stores accepted votes that are waiting to sync to Google Sheets
+- file-based `OAUTH_TOKEN_JSON` can be refreshed/persisted to disk if you choose to store the token as a file
 
 Without a persistent disk:
 - local state files are ephemeral and may be lost on restart/redeploy
 - use raw JSON env vars for OAuth secrets instead of file paths
+
+If you use raw JSON for `OAUTH_TOKEN_JSON`, leave it as raw JSON. If you use a file path for the token and want refreshes to survive deploys, use a disk path:
+
+```bash
+OAUTH_TOKEN_JSON=/var/data/token.json
+```
+
+Live-poll reliability defaults can be overridden if needed:
+
+```bash
+VOTE_QUEUE_MAXSIZE=1000
+VOTE_MESSAGE_REFRESH_DEBOUNCE_SECONDS=1.5
+VOTE_TALLY_DEBOUNCE_SECONDS=3
+VOTE_TRACKER_DEBOUNCE_SECONDS=8
+TRACKED_STATE_SAVE_DEBOUNCE_SECONDS=1.5
+VOTE_JOURNAL_COMPACT_SECONDS=30
+VOTE_QUEUE_DRAIN_TIMEOUT_SECONDS=30
+PENDING_VOTE_EVENTS_FSYNC=false
+```
 
 ### 6. Common Render-Specific Issues
 
@@ -162,7 +196,7 @@ Without a persistent disk:
 - Startup fails immediately:
   - one of the required env vars is missing (`BOT_TOKEN`, `TELEGRAM_WEBHOOK_URL`, `OAUTH_CLIENT_JSON`, `OAUTH_TOKEN_JSON`)
 - Poll tracking resets after redeploy:
-  - expected if using local `native_poll_states.json` without persistent storage
+  - expected if using local `tracked_poll_states.json` without persistent storage
 
 ## Optional Environment Variables
 
@@ -175,4 +209,13 @@ Useful optional settings:
 - `MEMBER_CHECK_CSV_PATH` - local CSV for member lookup
 - `MEMBER_CHECK_SOURCE` / `MEMBER_CHECK_TAB` - live member lookup sheet
 - `MEMBER_RAW_SOURCE` - raw member data sheet source
-- `NATIVE_POLL_STATE_FILE` - local poll state file (default `native_poll_states.json`)
+- `TRACKED_POLL_STATE_FILE` - local poll state file (default `tracked_poll_states.json`)
+- `PENDING_VOTE_EVENTS_FILE` - local pending vote journal (default `pending_vote_events.jsonl`)
+- `PENDING_VOTE_EVENTS_FSYNC` - set `true` to fsync each pending vote journal write
+- `VOTE_QUEUE_MAXSIZE` - max queued pending vote writes per poll before vote handlers wait
+- `VOTE_MESSAGE_REFRESH_DEBOUNCE_SECONDS` - minimum delay between Telegram count refreshes
+- `VOTE_TALLY_DEBOUNCE_SECONDS` - minimum delay between Tally sheet summary writes
+- `VOTE_TRACKER_DEBOUNCE_SECONDS` - minimum delay between tracker aggregate writes
+- `TRACKED_STATE_SAVE_DEBOUNCE_SECONDS` - debounce delay for local poll state saves
+- `VOTE_JOURNAL_COMPACT_SECONDS` - minimum interval between pending vote journal compactions
+- `VOTE_QUEUE_DRAIN_TIMEOUT_SECONDS` - how long close/stop waits for pending vote writes to drain

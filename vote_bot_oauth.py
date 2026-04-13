@@ -182,7 +182,7 @@ PUBLISHPOLL_SAMPLE_TEMPLATE = (
 
 PUBLISHPOLL_MINIMAL_TEMPLATE = (
     "/publishpoll\n"
-    "channel=@ydaywasg\n"
+    "channel=@testdaywavotebot\n"
     "title=<Enter event title here>\n"
     "date=31-Dec-2099\n\n"
 )
