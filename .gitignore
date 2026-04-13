@@ -10,3 +10,4 @@ test_gsheet.py
 test_oauth_create_sheet.py
 test-discmsgbot*.json
 native_poll_states.json
+GOOGLE_APPS_SCRIPT_PORTING_SUMMARY.md

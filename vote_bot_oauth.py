@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import asyncio
+import contextlib
 import html
 import re
 import csv
@@ -45,6 +46,15 @@ MEMBER_RAW_EXISTING_GENDER_RANGE = os.environ.get("MEMBER_RAW_EXISTING_GENDER_RA
 MEMBER_RAW_NEWCOMER_HANDLE_RANGE = os.environ.get("MEMBER_RAW_NEWCOMER_HANDLE_RANGE", "DAYWA Newcomers List!F2:F").strip()
 MEMBER_RAW_NEWCOMER_GENDER_RANGE = os.environ.get("MEMBER_RAW_NEWCOMER_GENDER_RANGE", "DAYWA Newcomers List!G2:G").strip()
 TRACKED_POLL_STATE_FILE = os.environ.get("TRACKED_POLL_STATE_FILE", "tracked_poll_states.json").strip() or "tracked_poll_states.json"
+PENDING_VOTE_EVENTS_FILE = os.environ.get("PENDING_VOTE_EVENTS_FILE", "pending_vote_events.jsonl").strip() or "pending_vote_events.jsonl"
+PENDING_VOTE_EVENTS_FSYNC = os.environ.get("PENDING_VOTE_EVENTS_FSYNC", "false").strip().lower() in {"1", "true", "yes"}
+VOTE_QUEUE_MAXSIZE = max(1, int(os.environ.get("VOTE_QUEUE_MAXSIZE", "1000")))
+VOTE_MESSAGE_REFRESH_DEBOUNCE_SECONDS = max(0.1, float(os.environ.get("VOTE_MESSAGE_REFRESH_DEBOUNCE_SECONDS", "1.5")))
+VOTE_TALLY_DEBOUNCE_SECONDS = max(0.1, float(os.environ.get("VOTE_TALLY_DEBOUNCE_SECONDS", "3")))
+VOTE_TRACKER_DEBOUNCE_SECONDS = max(0.1, float(os.environ.get("VOTE_TRACKER_DEBOUNCE_SECONDS", "8")))
+TRACKED_STATE_SAVE_DEBOUNCE_SECONDS = max(0.1, float(os.environ.get("TRACKED_STATE_SAVE_DEBOUNCE_SECONDS", "1.5")))
+VOTE_JOURNAL_COMPACT_SECONDS = max(1.0, float(os.environ.get("VOTE_JOURNAL_COMPACT_SECONDS", "30")))
+VOTE_QUEUE_DRAIN_TIMEOUT_SECONDS = max(1.0, float(os.environ.get("VOTE_QUEUE_DRAIN_TIMEOUT_SECONDS", "30")))
 DEFAULT_PUBLISH_CHAT = os.environ.get("DEFAULT_PUBLISH_CHAT", "").strip()
 ALLOWED_TELEGRAM_USER_IDS_RAW = os.environ.get("ALLOWED_TELEGRAM_USER_IDS", "").strip()
 
@@ -2062,6 +2072,14 @@ PENDING_STOPPOLL_PICKERS = {}  # token -> {poll_ids, chat_id, user_id, created_t
 SCHEDULED_POLL_CLOSE_TASKS: dict[str, asyncio.Task[Any]] = {}
 POLL_PERSIST_LOCKS: dict[str, asyncio.Lock] = {}
 BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+POLL_VOTE_QUEUES: dict[str, asyncio.Queue[dict[str, Any]]] = {}
+POLL_VOTE_WORKERS: dict[str, asyncio.Task[Any]] = {}
+PENDING_VOTE_EVENTS: dict[str, dict[str, Any]] = {}
+POLL_MESSAGE_REFRESH_TASKS: dict[str, asyncio.Task[Any]] = {}
+POLL_TALLY_UPDATE_TASKS: dict[str, asyncio.Task[Any]] = {}
+POLL_TRACKER_UPDATE_TASKS: dict[str, asyncio.Task[Any]] = {}
+TRACKED_STATE_SAVE_TASK: Optional[asyncio.Task[Any]] = None
+PENDING_VOTE_JOURNAL_LAST_COMPACT_TS = 0.0
 MEMBER_INDEX = {"enabled": False, "source": "", "handles": set(), "names": {}}
 MEMBER_INDEX_LAST_REFRESH_TS = 0.0
 SHEETS = None
@@ -2117,6 +2135,520 @@ def _spawn_background_task(coro: Awaitable[Any], *, name: str) -> None:
             print(f"Background task failed ({name}):", e)
 
     task.add_done_callback(_done_callback)
+
+
+def _append_vote_journal_record(record: dict[str, Any]) -> None:
+    if not PENDING_VOTE_EVENTS_FILE:
+        return
+    journal_dir = os.path.dirname(PENDING_VOTE_EVENTS_FILE)
+    if journal_dir:
+        os.makedirs(journal_dir, exist_ok=True)
+    with open(PENDING_VOTE_EVENTS_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=True, separators=(",", ":"), default=str))
+        f.write("\n")
+        f.flush()
+        if PENDING_VOTE_EVENTS_FSYNC:
+            os.fsync(f.fileno())
+
+
+def _register_pending_vote_event(event: dict[str, Any], *, write_journal: bool) -> None:
+    event_id = str(event.get("event_id", "") or "").strip()
+    if not event_id:
+        event_id = uuid.uuid4().hex
+        event["event_id"] = event_id
+    PENDING_VOTE_EVENTS[event_id] = event
+    if not write_journal:
+        return
+    try:
+        _append_vote_journal_record({"op": "pending", "event": event})
+    except Exception as e:
+        print("Pending vote journal append failed:", e)
+
+
+def _mark_vote_event_persisted(event_id: str) -> None:
+    event_id = str(event_id or "").strip()
+    if not event_id:
+        return
+    PENDING_VOTE_EVENTS.pop(event_id, None)
+    try:
+        _append_vote_journal_record(
+            {"op": "flushed", "event_id": event_id, "flushed_ts": time.time()}
+        )
+    except Exception as e:
+        print("Pending vote journal flush marker failed:", e)
+    _compact_pending_vote_journal_if_due()
+
+
+def _compact_pending_vote_journal_if_due(*, force: bool = False) -> None:
+    global PENDING_VOTE_JOURNAL_LAST_COMPACT_TS
+    if not PENDING_VOTE_EVENTS_FILE:
+        return
+    now = time.time()
+    if not force and (now - PENDING_VOTE_JOURNAL_LAST_COMPACT_TS) < VOTE_JOURNAL_COMPACT_SECONDS:
+        return
+    PENDING_VOTE_JOURNAL_LAST_COMPACT_TS = now
+
+    journal_dir = os.path.dirname(PENDING_VOTE_EVENTS_FILE)
+    if journal_dir:
+        os.makedirs(journal_dir, exist_ok=True)
+    tmp_path = f"{PENDING_VOTE_EVENTS_FILE}.tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for event in sorted(
+                PENDING_VOTE_EVENTS.values(),
+                key=lambda item: float(item.get("created_ts", 0) or 0),
+            ):
+                record = {"op": "pending", "event": event}
+                f.write(json.dumps(record, ensure_ascii=True, separators=(",", ":"), default=str))
+                f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, PENDING_VOTE_EVENTS_FILE)
+    except Exception as e:
+        print("Pending vote journal compact failed:", e)
+
+
+def load_pending_vote_events() -> int:
+    PENDING_VOTE_EVENTS.clear()
+    if not PENDING_VOTE_EVENTS_FILE or not os.path.exists(PENDING_VOTE_EVENTS_FILE):
+        return 0
+
+    try:
+        with open(PENDING_VOTE_EVENTS_FILE, "r", encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                raw = line.strip()
+                if not raw:
+                    continue
+                try:
+                    record = json.loads(raw)
+                except json.JSONDecodeError as e:
+                    print(f"Ignoring invalid pending vote journal line {line_no}:", e)
+                    continue
+                if not isinstance(record, dict):
+                    continue
+
+                op = str(record.get("op", "") or "").strip().lower()
+                if op == "flushed":
+                    event_id = str(record.get("event_id", "") or "").strip()
+                    if event_id:
+                        PENDING_VOTE_EVENTS.pop(event_id, None)
+                    continue
+
+                event = record.get("event") if op == "pending" else record
+                if not isinstance(event, dict):
+                    continue
+                event_id = str(event.get("event_id", "") or "").strip()
+                poll_id = str(event.get("poll_id", "") or "").strip()
+                if not event_id or not poll_id:
+                    continue
+                PENDING_VOTE_EVENTS[event_id] = event
+    except Exception as e:
+        print("Pending vote journal load failed:", e)
+        return 0
+
+    if PENDING_VOTE_EVENTS:
+        _compact_pending_vote_journal_if_due(force=True)
+    return len(PENDING_VOTE_EVENTS)
+
+
+def _schedule_tracked_poll_state_save(delay: Optional[float] = None) -> None:
+    global TRACKED_STATE_SAVE_TASK
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        save_tracked_poll_states()
+        return
+
+    wait_seconds = TRACKED_STATE_SAVE_DEBOUNCE_SECONDS if delay is None else max(0.0, float(delay))
+    if wait_seconds <= 0:
+        save_tracked_poll_states()
+        return
+    if TRACKED_STATE_SAVE_TASK and not TRACKED_STATE_SAVE_TASK.done():
+        return
+
+    async def _runner():
+        global TRACKED_STATE_SAVE_TASK
+        try:
+            await asyncio.sleep(wait_seconds)
+            save_tracked_poll_states()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print("Debounced tracked poll state save failed:", e)
+        finally:
+            if TRACKED_STATE_SAVE_TASK is asyncio.current_task():
+                TRACKED_STATE_SAVE_TASK = None
+
+    TRACKED_STATE_SAVE_TASK = asyncio.create_task(_runner(), name="tracked-state-save")
+
+
+async def _flush_tracked_poll_state_save() -> None:
+    global TRACKED_STATE_SAVE_TASK
+    task = TRACKED_STATE_SAVE_TASK
+    if task and not task.done() and task is not asyncio.current_task():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    TRACKED_STATE_SAVE_TASK = None
+    save_tracked_poll_states()
+
+
+async def _cancel_debounce_task(task_map: dict[str, asyncio.Task[Any]], poll_id: str) -> None:
+    task = task_map.pop(str(poll_id), None)
+    if task and not task.done() and task is not asyncio.current_task():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+async def _flush_poll_tally_update(poll_id: str, poll_state: Optional[dict] = None) -> None:
+    state = poll_state
+    if not isinstance(state, dict):
+        _, state = _find_tracked_poll(str(poll_id))
+    if not isinstance(state, dict):
+        return
+    spreadsheet_id = str(state.get("spreadsheet_id", "") or "").strip()
+    if not spreadsheet_id:
+        return
+
+    lock = _get_poll_persist_lock(str(poll_id))
+    async with lock:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: update_tally(
+                SHEETS,
+                spreadsheet_id,
+                state.get("choices", CHOICES),
+                state.get("counts", [0, 0]),
+            ),
+        )
+
+
+async def _flush_poll_tracker_update(poll_id: str, poll_state: Optional[dict] = None) -> None:
+    state = poll_state
+    if not isinstance(state, dict):
+        _, state = _find_tracked_poll(str(poll_id))
+    if not isinstance(state, dict):
+        return
+
+    lock = _get_poll_persist_lock(str(poll_id))
+    async with lock:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None,
+            lambda: update_tracker_overview_aggregates(
+                SHEETS,
+                DRIVE,
+                poll_id=str(poll_id),
+                total_votes=len(state.get("votes", {})),
+                option_vote_counts=list(state.get("counts", [])),
+            ),
+        )
+
+
+def _schedule_poll_tally_update(poll_id: str) -> None:
+    token = str(poll_id or "").strip()
+    if not token:
+        return
+    task = POLL_TALLY_UPDATE_TASKS.get(token)
+    if task and not task.done():
+        return
+
+    async def _runner():
+        try:
+            await asyncio.sleep(VOTE_TALLY_DEBOUNCE_SECONDS)
+            await _flush_poll_tally_update(token)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print("Debounced tally update failed for", token, ":", e)
+        finally:
+            if POLL_TALLY_UPDATE_TASKS.get(token) is asyncio.current_task():
+                POLL_TALLY_UPDATE_TASKS.pop(token, None)
+
+    POLL_TALLY_UPDATE_TASKS[token] = asyncio.create_task(
+        _runner(),
+        name=f"poll-tally-update-{token}",
+    )
+
+
+def _schedule_poll_tracker_update(poll_id: str) -> None:
+    token = str(poll_id or "").strip()
+    if not token:
+        return
+    task = POLL_TRACKER_UPDATE_TASKS.get(token)
+    if task and not task.done():
+        return
+
+    async def _runner():
+        try:
+            await asyncio.sleep(VOTE_TRACKER_DEBOUNCE_SECONDS)
+            await _flush_poll_tracker_update(token)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print("Debounced tracker update failed for", token, ":", e)
+        finally:
+            if POLL_TRACKER_UPDATE_TASKS.get(token) is asyncio.current_task():
+                POLL_TRACKER_UPDATE_TASKS.pop(token, None)
+
+    POLL_TRACKER_UPDATE_TASKS[token] = asyncio.create_task(
+        _runner(),
+        name=f"poll-tracker-update-{token}",
+    )
+
+
+async def _flush_poll_summary_updates(poll_id: str, poll_state: Optional[dict] = None) -> None:
+    token = str(poll_id or "").strip()
+    if not token:
+        return
+    await _cancel_debounce_task(POLL_TALLY_UPDATE_TASKS, token)
+    await _cancel_debounce_task(POLL_TRACKER_UPDATE_TASKS, token)
+    try:
+        await _flush_poll_tally_update(token, poll_state)
+    except Exception as e:
+        print("Final tally update failed for", token, ":", e)
+    try:
+        await _flush_poll_tracker_update(token, poll_state)
+    except Exception as e:
+        print("Final tracker update failed for", token, ":", e)
+
+
+def _schedule_inline_poll_message_refresh(bot, poll_id: str, poll_state: dict) -> None:
+    token = str(poll_id or "").strip()
+    if not token or poll_state.get("closed"):
+        return
+    task = POLL_MESSAGE_REFRESH_TASKS.get(token)
+    if task and not task.done():
+        return
+
+    async def _runner():
+        try:
+            await asyncio.sleep(VOTE_MESSAGE_REFRESH_DEBOUNCE_SECONDS)
+            _, current_state = _find_tracked_poll(token)
+            if isinstance(current_state, dict):
+                await _refresh_inline_poll_message(bot, token, current_state)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print("Debounced inline poll refresh failed for", token, ":", e)
+        finally:
+            if POLL_MESSAGE_REFRESH_TASKS.get(token) is asyncio.current_task():
+                POLL_MESSAGE_REFRESH_TASKS.pop(token, None)
+
+    POLL_MESSAGE_REFRESH_TASKS[token] = asyncio.create_task(
+        _runner(),
+        name=f"poll-message-refresh-{token}",
+    )
+
+
+def _get_poll_vote_queue(poll_id: str) -> asyncio.Queue[dict[str, Any]]:
+    token = str(poll_id or "").strip()
+    queue = POLL_VOTE_QUEUES.get(token)
+    if queue is None:
+        queue = asyncio.Queue(maxsize=VOTE_QUEUE_MAXSIZE)
+        POLL_VOTE_QUEUES[token] = queue
+    return queue
+
+
+def _choice_index_from_vote_result(poll_state: dict, vote_result: dict[str, Any]) -> Optional[int]:
+    raw_desired_idx = vote_result.get("desired_idx")
+    if raw_desired_idx is not None and str(raw_desired_idx) != "":
+        try:
+            desired_idx = int(raw_desired_idx)
+            if 0 <= desired_idx < len(list(poll_state.get("choices") or CHOICES)):
+                return desired_idx
+        except (TypeError, ValueError):
+            pass
+
+    choice_text = str(vote_result.get("new_choice_text", "") or "").strip()
+    if not choice_text or choice_text == "CANCELLED":
+        return None
+    lunch_text = str(vote_result.get("new_lunch", "") or "").strip()
+    choices = list(poll_state.get("choices") or CHOICES)
+    for idx, (label, lunch) in enumerate(choices):
+        if (str(label), str(lunch)) == (choice_text, lunch_text):
+            return idx
+    for idx, (label, _) in enumerate(choices):
+        if str(label) == choice_text:
+            return idx
+    return None
+
+
+def _reconcile_poll_state_from_vote_result(poll_state: dict, vote_result: dict[str, Any]) -> None:
+    try:
+        user_id = int(vote_result.get("user_id", 0))
+    except (TypeError, ValueError):
+        return
+    if user_id <= 0:
+        return
+
+    choices = list(poll_state.get("choices") or CHOICES)
+    counts = list(poll_state.get("counts") or [])
+    while len(counts) < len(choices):
+        counts.append(0)
+    poll_state["counts"] = counts
+
+    desired_idx = _choice_index_from_vote_result(poll_state, vote_result)
+    current_idx = poll_state.get("votes", {}).get(user_id)
+    if current_idx == desired_idx:
+        return
+
+    try:
+        current_idx_int = int(current_idx) if current_idx is not None else None
+    except (TypeError, ValueError):
+        current_idx_int = None
+    if current_idx_int is not None and 0 <= current_idx_int < len(counts):
+        counts[current_idx_int] = max(0, int(counts[current_idx_int]) - 1)
+
+    if desired_idx is None:
+        poll_state.get("votes", {}).pop(user_id, None)
+        return
+
+    poll_state.setdefault("votes", {})[user_id] = desired_idx
+    if 0 <= desired_idx < len(counts):
+        counts[desired_idx] = int(counts[desired_idx]) + 1
+
+
+def _ensure_poll_vote_worker(application: Application, poll_id: str) -> None:
+    token = str(poll_id or "").strip()
+    if not token:
+        return
+    existing = POLL_VOTE_WORKERS.get(token)
+    if existing and not existing.done():
+        return
+
+    async def _worker():
+        queue = _get_poll_vote_queue(token)
+        while True:
+            event = await queue.get()
+            retry_event = None
+            retry_delay = 0.0
+            try:
+                event_poll_id = str(event.get("poll_id", "") or token).strip()
+                event_id = str(event.get("event_id", "") or "").strip()
+                _, poll_state = _find_tracked_poll(event_poll_id)
+                if not isinstance(poll_state, dict):
+                    print("Pending vote event has no tracked poll state:", event_id, event_poll_id)
+                    continue
+                vote_result = event.get("vote_result") or {}
+                if not isinstance(vote_result, dict):
+                    print("Pending vote event is missing vote_result:", event_id, event_poll_id)
+                    continue
+                await _persist_vote_selection(
+                    application.bot,
+                    poll_id=event_poll_id,
+                    poll_state=poll_state,
+                    vote_result=vote_result,
+                    event_id=event_id,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                attempts = int(event.get("attempts", 0) or 0) + 1
+                event["attempts"] = attempts
+                retry_delay = min(60.0, float(2 ** min(attempts, 5)))
+                retry_event = event
+                print(
+                    "Vote persistence failed for",
+                    str(event.get("event_id", "") or ""),
+                    "poll_id=" + token,
+                    "retrying in",
+                    f"{retry_delay:.1f}s:",
+                    e,
+                )
+            finally:
+                if retry_event is not None:
+                    await asyncio.sleep(retry_delay)
+                    await queue.put(retry_event)
+                queue.task_done()
+
+    POLL_VOTE_WORKERS[token] = asyncio.create_task(_worker(), name=f"poll-vote-worker-{token}")
+
+
+async def _enqueue_pending_vote_event(
+    application: Application,
+    poll_id: str,
+    event: dict[str, Any],
+) -> None:
+    token = str(poll_id or "").strip()
+    if not token:
+        return
+    _ensure_poll_vote_worker(application, token)
+    await _get_poll_vote_queue(token).put(event)
+
+
+async def _queue_vote_result_for_persistence(
+    application: Application,
+    poll_id: str,
+    vote_result: dict[str, Any],
+) -> None:
+    event = {
+        "event_id": uuid.uuid4().hex,
+        "poll_id": str(poll_id),
+        "created_ts": time.time(),
+        "vote_result": json.loads(json.dumps(vote_result, ensure_ascii=True, default=str)),
+    }
+    _register_pending_vote_event(event, write_journal=True)
+    await _enqueue_pending_vote_event(application, str(poll_id), event)
+
+
+async def _replay_pending_vote_events(application: Application) -> None:
+    if not PENDING_VOTE_EVENTS:
+        return
+    replayed = 0
+    skipped = 0
+    events = sorted(
+        PENDING_VOTE_EVENTS.values(),
+        key=lambda item: float(item.get("created_ts", 0) or 0),
+    )
+    for event in events:
+        poll_id = str(event.get("poll_id", "") or "").strip()
+        _, poll_state = _find_tracked_poll(poll_id)
+        if not poll_id or not isinstance(poll_state, dict):
+            skipped += 1
+            continue
+        vote_result = event.get("vote_result") or {}
+        if isinstance(vote_result, dict):
+            _reconcile_poll_state_from_vote_result(poll_state, vote_result)
+        await _enqueue_pending_vote_event(application, poll_id, event)
+        replayed += 1
+    if replayed:
+        _schedule_tracked_poll_state_save()
+        print("Requeued pending vote events:", replayed)
+    if skipped:
+        print("Pending vote events skipped because poll state is missing:", skipped)
+
+
+async def _drain_poll_vote_queue(poll_id: str, *, timeout: Optional[float] = None) -> bool:
+    token = str(poll_id or "").strip()
+    if not token:
+        return True
+    worker = POLL_VOTE_WORKERS.get(token)
+    if worker is not None and worker is asyncio.current_task():
+        return True
+    queue = POLL_VOTE_QUEUES.get(token)
+    if queue is None:
+        return True
+    try:
+        await asyncio.wait_for(queue.join(), timeout or VOTE_QUEUE_DRAIN_TIMEOUT_SECONDS)
+        return True
+    except asyncio.TimeoutError:
+        print("Timed out waiting for vote queue to drain for", token)
+        return False
+
+
+async def _stop_poll_vote_worker(poll_id: str) -> None:
+    token = str(poll_id or "").strip()
+    if not token:
+        return
+    task = POLL_VOTE_WORKERS.pop(token, None)
+    if task and not task.done() and task is not asyncio.current_task():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+    POLL_VOTE_QUEUES.pop(token, None)
 
 
 def _prune_pending_publish_previews() -> None:
@@ -2370,8 +2902,15 @@ def save_tracked_poll_states() -> None:
     for key, state in _iter_tracked_poll_states():
         payload["inline_polls"][str(key[1])] = _serialize_poll_state(state)
 
-    with open(TRACKED_POLL_STATE_FILE, "w", encoding="utf-8") as f:
+    state_dir = os.path.dirname(TRACKED_POLL_STATE_FILE)
+    if state_dir:
+        os.makedirs(state_dir, exist_ok=True)
+    tmp_path = f"{TRACKED_POLL_STATE_FILE}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=True, indent=2, sort_keys=True)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_path, TRACKED_POLL_STATE_FILE)
 
 
 def load_tracked_poll_states() -> int:
@@ -3000,6 +3539,7 @@ def _apply_vote_selection_to_state(
 ) -> dict[str, Any]:
     poll_choices = poll_state.get("choices", list(CHOICES))
     prev_idx = poll_state["votes"].get(user.id)
+    desired_idx: Optional[int] = None
 
     if selected_idx is None:
         if prev_idx is None:
@@ -3030,12 +3570,14 @@ def _apply_vote_selection_to_state(
             action = f"Changed vote: {poll_choices[prev_idx][0]} -> {poll_choices[idx][0]}"
             new_choice_text, new_lunch = poll_choices[idx]
             feedback_text = f"Vote updated: {new_choice_text}"
+            desired_idx = idx
         else:
             poll_state["votes"][user.id] = idx
             poll_state["counts"][idx] += 1
             action = "Recorded vote"
             new_choice_text, new_lunch = poll_choices[idx]
             feedback_text = f"Vote recorded: {new_choice_text}"
+            desired_idx = idx
 
     username = user.username or ""
     full_name = (user.full_name or "").strip()
@@ -3056,22 +3598,21 @@ def _apply_vote_selection_to_state(
         "username_link": username_link,
         "handle": handle,
         "poll_id": str(poll_id),
+        "previous_idx": prev_idx,
+        "desired_idx": desired_idx,
     }
 
 
 async def _persist_vote_selection(
-    context: ContextTypes.DEFAULT_TYPE,
+    bot,
     *,
     poll_id: str,
     poll_state: dict,
     vote_result: dict[str, Any],
-    refresh_message: bool,
+    event_id: str = "",
 ) -> None:
     lock = _get_poll_persist_lock(poll_id)
     async with lock:
-        if refresh_message:
-            await _refresh_inline_poll_message(context.bot, str(poll_id), poll_state)
-
         loop = asyncio.get_running_loop()
         await _refresh_member_index_if_due(loop)
         newcomer_value = classify_newcomer(
@@ -3114,38 +3655,22 @@ async def _persist_vote_selection(
             )
 
         await loop.run_in_executor(None, _write)
-        await loop.run_in_executor(
-            None,
-            lambda: update_tally(
-                SHEETS,
-                poll_state["spreadsheet_id"],
-                poll_state.get("choices", CHOICES),
-                poll_state.get("counts", [0, 0]),
-            ),
-        )
-        try:
-            await loop.run_in_executor(
-                None,
-                lambda: update_tracker_overview_aggregates(
-                    SHEETS,
-                    DRIVE,
-                    poll_id=str(poll_id),
-                    total_votes=len(poll_state.get("votes", {})),
-                    option_vote_counts=list(poll_state.get("counts", [])),
-                ),
-            )
-        except Exception as e:
-            print("Tracker overview aggregate update failed:", e)
-        save_tracked_poll_states()
+        _mark_vote_event_persisted(event_id)
+        _schedule_poll_tally_update(str(poll_id))
+        _schedule_poll_tracker_update(str(poll_id))
+        _schedule_tracked_poll_state_save()
 
         cap = int(poll_state.get("cap", 0) or 0)
         if not poll_state.get("closed") and cap > 0 and len(poll_state["votes"]) >= cap:
-            await _close_tracked_poll(
-                bot=context.bot,
-                poll_id=str(poll_id),
-                closed_by="auto_cap",
-                notice_text=f"Poll closed automatically (cap reached: {cap}).",
-            )
+            try:
+                await _close_tracked_poll(
+                    bot=bot,
+                    poll_id=str(poll_id),
+                    closed_by="auto_cap",
+                    notice_text=f"Poll closed automatically (cap reached: {cap}).",
+                )
+            except Exception as e:
+                print("Auto-close after cap failed for", poll_id, ":", e)
 
 
 def _extract_update_user_id(update: Update) -> Optional[int]:
@@ -3606,7 +4131,12 @@ async def _close_tracked_poll(
 
     poll_state["closed"] = True
     _cancel_scheduled_poll_close(str(poll_id))
-    save_tracked_poll_states()
+    await _cancel_debounce_task(POLL_MESSAGE_REFRESH_TASKS, str(poll_id))
+    called_from_vote_worker = POLL_VOTE_WORKERS.get(str(poll_id)) is asyncio.current_task()
+    if not called_from_vote_worker:
+        await _drain_poll_vote_queue(str(poll_id))
+        await _flush_poll_summary_updates(str(poll_id), poll_state)
+    await _flush_tracked_poll_state_save()
 
     spreadsheet_id = str(poll_state.get("spreadsheet_id", "") or "")
     close_date, close_time = now_utc8_date_time()
@@ -3697,6 +4227,17 @@ async def _stop_tracked_poll_and_remove(
                     print("Inline poll keyboard clear failed for stoppoll:", inner)
         matched_state["closed"] = True
 
+    await _cancel_debounce_task(POLL_MESSAGE_REFRESH_TASKS, poll_id)
+    drained = await _drain_poll_vote_queue(poll_id)
+    if not drained:
+        await _flush_tracked_poll_state_save()
+        raise RuntimeError(
+            "Vote sync is still catching up. The poll is closed, but tracking was not removed yet. "
+            "Try /stoppoll again in a moment."
+        )
+    await _flush_poll_summary_updates(poll_id, matched_state)
+    await _flush_tracked_poll_state_save()
+
     spreadsheet_id = str(matched_state.get("spreadsheet_id", "") or "")
     if spreadsheet_id and not was_closed:
         close_date, close_time = now_utc8_date_time()
@@ -3734,6 +4275,7 @@ async def _stop_tracked_poll_and_remove(
 
     _cancel_scheduled_poll_close(poll_id)
     POLL_STATES.pop(matched_key, None)
+    await _stop_poll_vote_worker(poll_id)
     save_tracked_poll_states()
 
     reply = []
@@ -4144,6 +4686,12 @@ async def on_inline_poll_vote_action(update: Update, context: ContextTypes.DEFAU
         await query.answer()
         return
 
+    cap = int(poll_state.get("cap", 0) or 0)
+    existing_vote = poll_state.get("votes", {}).get(query.from_user.id)
+    if cap > 0 and existing_vote is None and len(poll_state.get("votes", {})) >= cap:
+        await query.answer("Voting is closed because the cap has been reached.", show_alert=True)
+        return
+
     try:
         selected_idx = int(action)
     except (TypeError, ValueError):
@@ -4159,16 +4707,9 @@ async def on_inline_poll_vote_action(update: Update, context: ContextTypes.DEFAU
     )
     feedback_text = str(vote_result.get("feedback_text", "") or "")
     if vote_result.get("should_persist"):
-        _spawn_background_task(
-            _persist_vote_selection(
-                context,
-                poll_id=str(poll_id),
-                poll_state=poll_state,
-                vote_result=vote_result,
-                refresh_message=True,
-            ),
-            name=f"persist-inline-vote-{poll_id}",
-        )
+        _schedule_inline_poll_message_refresh(context.bot, str(poll_id), poll_state)
+        _schedule_tracked_poll_state_save()
+        await _queue_vote_result_for_persistence(context.application, str(poll_id), vote_result)
     answer_text = feedback_text or "Vote updated."
     if len(answer_text) > 180:
         answer_text = answer_text[:177].rstrip() + "..."
@@ -4191,6 +4732,9 @@ def initialize_runtime_services():
     restored_tracked = load_tracked_poll_states()
     if restored_tracked:
         print("Restored tracked polls:", restored_tracked, "from", TRACKED_POLL_STATE_FILE)
+    restored_pending_votes = load_pending_vote_events()
+    if restored_pending_votes:
+        print("Loaded pending vote events:", restored_pending_votes, "from", PENDING_VOTE_EVENTS_FILE)
 
     if MEMBER_RAW_SOURCE:
         try:
@@ -4241,6 +4785,7 @@ async def _on_telegram_app_post_init(telegram_app: Application) -> None:
     for key, state in list(_iter_tracked_poll_states()):
         poll_id = str(key[1])
         _ensure_poll_close_schedule_for_state(telegram_app, poll_id, state)
+    await _replay_pending_vote_events(telegram_app)
 
 
 def build_telegram_application() -> Application:
